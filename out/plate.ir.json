@@ -1,0 +1,50 @@
+{
+  "name": "plate",
+  "features": [
+    {
+      "kind": "sketch",
+      "name": "outline",
+      "plane": "XY",
+      "on": null,
+      "circles": [],
+      "rects": [
+        [
+          40,
+          30,
+          0,
+          0
+        ]
+      ],
+      "polys": []
+    },
+    {
+      "kind": "pad",
+      "name": "body",
+      "sketch": "outline",
+      "length": 10,
+      "symmetric": false
+    },
+    {
+      "kind": "sketch",
+      "name": "hole_sketch",
+      "plane": "XY",
+      "on": null,
+      "circles": [
+        [
+          0,
+          0,
+          4
+        ]
+      ],
+      "rects": [],
+      "polys": []
+    },
+    {
+      "kind": "pocket",
+      "name": "hole",
+      "sketch": "hole_sketch",
+      "through": true,
+      "length": null
+    }
+  ]
+}

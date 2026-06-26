@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated CAD artifacts (regenerate with: python3 gen.py --sample plate)
+out/*.FCStd
+out/*.stl

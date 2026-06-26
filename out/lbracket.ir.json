@@ -1,0 +1,70 @@
+{
+  "name": "lbracket",
+  "features": [
+    {
+      "kind": "sketch",
+      "name": "profile",
+      "plane": "XY",
+      "on": null,
+      "circles": [],
+      "rects": [],
+      "polys": [
+        [
+          [
+            0,
+            0
+          ],
+          [
+            40,
+            0
+          ],
+          [
+            40,
+            14
+          ],
+          [
+            16,
+            14
+          ],
+          [
+            16,
+            30
+          ],
+          [
+            0,
+            30
+          ]
+        ]
+      ]
+    },
+    {
+      "kind": "pad",
+      "name": "body",
+      "sketch": "profile",
+      "length": 6,
+      "symmetric": false
+    },
+    {
+      "kind": "sketch",
+      "name": "hole_sketch",
+      "plane": "XY",
+      "on": null,
+      "circles": [
+        [
+          8,
+          8,
+          2.6
+        ]
+      ],
+      "rects": [],
+      "polys": []
+    },
+    {
+      "kind": "pocket",
+      "name": "hole",
+      "sketch": "hole_sketch",
+      "through": true,
+      "length": null
+    }
+  ]
+}
