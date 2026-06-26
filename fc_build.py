@@ -104,6 +104,12 @@ def build(spec, out_path):
         doc.recompute()
 
     doc.recompute()
+    # A headless (freecadcmd) doc has no GUI visibility state, so it opens ALL-HIDDEN in the
+    # FreeCAD GUI. Set App-level Visibility (persists to the file, the GUI honours it): show the
+    # Body + final tip solid, hide sketches/intermediate features.
+    for o in doc.Objects:
+        if hasattr(o, "Visibility"):
+            o.Visibility = (o is body or o is tip)
     doc.saveAs(out_path)
     stl = out_path[:-6] + ".stl" if out_path.endswith(".FCStd") else out_path + ".stl"
     body.Shape.exportStl(stl)

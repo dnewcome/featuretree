@@ -7,8 +7,10 @@ description: >-
   when a part should be inspectable/editable in FreeCAD's parametric tree, not handed off as a
   dead STEP/STL solid (which imports as one frozen lump). Supports rectangle, circle, AND
   arbitrary polygon / profile-with-holes sketches, pads, pockets (through/blind), and
-  query-selected fillets. Requires the FreeCAD AppImage (auto-located at /opt, override with
-  FREECAD_APPIMAGE / FREECAD_CMD).
+  query-selected fillets. The SAME IR also emits to a live Onshape Part Studio (via onpy) —
+  sketches/pad/pocket — so one design drives FreeCAD and Onshape. Requires the FreeCAD AppImage
+  (auto-located at /opt, override with FREECAD_APPIMAGE / FREECAD_CMD); the Onshape backend needs
+  `pip install onpy` + an Onshape API key.
 ---
 
 # featuretree — operation-preserving CAD round-trip

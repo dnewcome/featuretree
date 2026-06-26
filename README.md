@@ -1,6 +1,6 @@
 # featuretree
 
-**Emit an editable FreeCAD feature tree from a small neutral feature-IR — and round-trip human edits back by name.**
+**Emit an editable feature tree — in FreeCAD *and* Onshape — from a small neutral feature-IR, and round-trip human edits back by name.**
 
 A neutral *file* (STEP/STL) loses the parametric feature tree: it imports into FreeCAD as one
 frozen solid you can't edit by operation. `featuretree` keeps the tree. You author a design once as
@@ -38,6 +38,8 @@ wall that kills neutral feature-file formats. The IR sidesteps it:
   `FREECAD_APPIMAGE` (path to the AppImage) or `FREECAD_CMD` (path to a `freecadcmd` binary)
   environment variables.
 - **Python 3** for the host-side scripts (`gen.py` / `roundtrip.py`).
+- **For the Onshape backend (optional):** `pip install onpy` and an Onshape API key (access +
+  secret) from <https://dev-portal.onshape.com>. See [Onshape backend](#onshape-backend).
 
 ## Install
 
@@ -106,9 +108,50 @@ tree — export those as STEP/STL and import as a single solid, and say so.
 | `fc_build.py` | FreeCAD's Python 3.11 | build the native PartDesign tree |
 | `fc_read.py` | FreeCAD's Python 3.11 | read labels / params back out |
 | `fc_common.py` | FreeCAD's Python 3.11 | shared FreeCAD-side helpers |
+| `onshape_client.py` | host Python 3 | Onshape REST client (HMAC) — create a doc, run FeatureScript |
+| `onshape_emit.py` | host Python 3 | emit an IR spec → an Onshape Part Studio (via `onpy`) |
 
 Data passes to the FreeCAD-side scripts via **env vars**, never argv — `freecadcmd` treats extra path
 arguments as documents to open.
+
+## Onshape backend
+
+The same IR also drives **Onshape** — one IR emits to FreeCAD *and* a live Onshape Part Studio, so the
+design opens, editable, in cloud CAD too. Onshape geometry is created through
+[`onpy`](https://github.com/kyle-tennison/onpy) (a maintained Python Onshape API whose BTM
+serialization is known-correct); `onshape_client.py` is a small stdlib-only HMAC REST client used to
+create the document and run FeatureScript.
+
+```python
+import sys; sys.path.insert(0, "/path/to/featuretree")
+import ir, onshape_client as oc, onshape_emit
+spec = ir.SAMPLES["plate"]()                          # or your own ir.part(...)
+doc = oc.create_document("my-part", public=True)      # free accounts: public docs only
+onshape_emit.emit(spec, doc["did"])
+print("https://cad.onshape.com/documents/" + doc["did"])
+```
+
+**Auth** (two credentials, both kept out of the repo — same Onshape key pair):
+
+- `onshape_client.py` reads `ONSHAPE_ACCESS_KEY` / `ONSHAPE_SECRET_KEY` from the environment
+  (HMAC-SHA256 signing, `Accept: */*` — *not* `application/json`, which forces a regen-hostile
+  serialization).
+- `onpy` reads `~/.onpy/config.json` → `{"dev_access": "...", "dev_secret": "..."}`. `onpy.configure()`
+  is the *interactive* setup prompt — skip it once that file exists.
+
+### Onshape scope / gotchas
+
+- **Working:** sketches (polygons / circles / rects) on the Top plane → **Pad** (extrude) and
+  **Pocket** (subtract). Geometry is exact (a metric part round-trips to the right millimetre).
+- **Units:** onpy's `metric` system is **meters**, so the emitter scales the mm IR by `0.001`.
+- **Sketches arrive under-defined** ("not fully defined" / blue) — the API places geometry by
+  coordinate with no constraints. The solid is correct and won't drift; the IR is the source of truth,
+  so this is a property of the generated *view*, not a defect. (Fully-defining would mean authoring
+  constraints in raw BTM, which onpy doesn't expose.)
+- **Speed:** onpy re-solves the sketch on every entity add (a round-trip per line/circle), so dense
+  profiles (100+ segments) are slow — prefer `circles` over many-sided polygons and simplify outlines.
+- **Free Onshape accounts can only create public documents.**
+- **Not yet:** fillets, face-attached sketches, non-Top planes — build123d / FreeCAD still cover those.
 
 ## Use without Claude Code
 
@@ -121,8 +164,11 @@ run `gen.py` / `roundtrip.py` directly), and make sure the FreeCAD AppImage is l
 - **Working:** XY sketches (rect / circle / polygon + profile-with-holes), face-attached circle
   sketches, Pad, Pocket (through / blind), query fillets; parameter round-trip (lengths, radii) by
   name.
+- **Onshape backend (new):** sketches (polys / circles / rects) → Pad / Pocket via `onpy`; geometry
+  exact. Sketches arrive under-defined; fillets / face-attach / non-Top planes not yet. See
+  [Onshape backend](#onshape-backend).
 - **Deferred:** non-XY unattached planes, polygon / rect face-attached sketches, richer edge selectors
-  (by-radius / position / count), other backends (Onshape FeatureScript / Fusion / SolidWorks macro).
+  (by-radius / position / count), other backends (Fusion API / SolidWorks macro).
 - A SolidWorks `.SLDPRT` can't be written on Linux — that backend would emit a macro.
 
 ## License
