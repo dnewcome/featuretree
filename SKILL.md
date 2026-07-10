@@ -43,6 +43,7 @@ python3 $S/gen.py --sample poly          # exercises the polygon-profile primiti
 python3 $S/gen.py mypart.ir.json out/mypart.FCStd     # emit a spec you authored
 python3 $S/roundtrip.py out/mypart.FCStd              # read the tree/params back
 python3 $S/roundtrip.py out/mypart.FCStd edits.json   # apply a named edit, re-save, report
+python3 $S/b3d_emit.py --sample plate out/plate.stl   # SAME IR -> build123d solid (no FreeCAD)
 ```
 
 Authoring a part (Python, using the DSL — produce a JSON-able dict, write it, emit it):
@@ -69,7 +70,12 @@ json.dump(spec, open("bracket.ir.json","w"))            # then: python3 gen.py b
   to live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
 - `part(name, *features)` → the spec. `update_from_freecad(spec, params)` flows read-back edits in.
 
-## Bridging from build123d
+## build123d backend
+The same IR also renders to a **build123d Solid** in-process (`b3d_emit.emit(spec) -> (part, res)`),
+no FreeCAD. Same OCCT kernel, so identical geometry — the `plate` sample is 11497.3 mm³ from both.
+One IR → the editable tree AND a watertight solid to mesh/sim/interference-check; no second model.
+
+## Bridging IN from build123d (reverse)
 build123d bakes operations into a final solid, so you can't extract its "tree". Instead, author
 the part's operations as IR using the **same named constants** the build123d script uses (profile
 points, thickness, hole positions), so both paths describe one design. Extracted/complex 2D

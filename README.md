@@ -1,6 +1,6 @@
 # featuretree
 
-**Emit an editable feature tree — in FreeCAD *and* Onshape — from a small neutral feature-IR, and round-trip human edits back by name.**
+**Emit an editable feature tree — in FreeCAD *and* Onshape — from a small neutral feature-IR, round-trip human edits back by name, and render the same IR to a build123d solid.**
 
 A neutral *file* (STEP/STL) loses the parametric feature tree: it imports into FreeCAD as one
 frozen solid you can't edit by operation. `featuretree` keeps the tree. You author a design once as
@@ -89,19 +89,43 @@ json.dump(spec, open("bracket.ir.json", "w"))            # then: python3 gen.py 
   live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
 - `part(name, *features)` → the spec. `update_from_freecad(spec, params)` flows read-back edits in.
 
-## Bridging from build123d
+## build123d backend
 
-build123d bakes operations into a final solid, so you can't extract its "tree". Instead, author the
-part's operations as IR using the **same named constants** your build123d script uses (profile
-points, thickness, hole positions), so both paths describe one design. Extracted / complex 2D
-profiles go in as `polys`. Geometry that's a mesh boolean (no clean sketch/pad) can't be a feature
-tree — export those as STEP/STL and import as a single solid, and say so.
+The same IR also renders straight to a **build123d** solid, in the caller's own Python — no FreeCAD
+process. build123d and FreeCAD share the OpenCASCADE kernel, so the IR yields **identical geometry**
+either way: the `plate` sample is 11497.3 mm³ from both backends (Δ = 0.0). Author the design once as
+IR and get *both* the editable parametric tree (FreeCAD/Onshape) *and* a watertight solid you can
+mesh / simulate / interference-check — with no second, hand-maintained model to drift.
+
+```python
+import ir, b3d_emit
+part, res = b3d_emit.emit(ir.SAMPLES["plate"]())   # part is a build123d Solid
+print(res["volume"], "mm^3")                        # 11497.3, same as FreeCAD
+```
+
+```bash
+python3 b3d_emit.py --sample plate out/plate.stl    # IR -> watertight .stl
+```
+
+Coverage mirrors `fc_build.py`: sketches (circles / rects / polygons-with-holes) on XY or a part's
+top/bottom face, pad (± midplane), pocket (through / blind), and fillet by the **same edge query**
+the IR stores (resolved against live geometry, no kernel ids).
+
+### Bridging IN from build123d (the reverse direction)
+
+build123d bakes operations into a final solid, so you can't *extract* its tree. To bring an existing
+build123d part in, author its operations as IR using the **same named constants** your build123d
+script uses (profile points, thickness, hole positions), so both paths describe one design —
+then `b3d_emit` regenerates an equivalent solid to confirm parity. Extracted / complex 2D profiles go
+in as `polys`. Geometry that's a mesh boolean (no clean sketch/pad) can't be a feature tree — export
+those as STEP/STL and import as a single solid, and say so.
 
 ## How it runs
 
 | file | runs under | role |
 |------|-----------|------|
 | `ir.py` | any Python 3 | the DSL / IR — single source of truth, plain JSON-able dicts |
+| `b3d_emit.py` | host Python 3 | render an IR spec → a build123d Solid (+ `.stl`) in-process, no FreeCAD |
 | `gen.py` | host Python 3 | emit an IR spec → `.FCStd` (+ `.stl`); shells out to FreeCAD |
 | `roundtrip.py` | host Python 3 | read the tree / params back; optionally apply named edits |
 | `runner.py` | host Python 3 | locate / extract `freecadcmd`, run a script under it |
