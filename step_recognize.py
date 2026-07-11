@@ -1,33 +1,101 @@
 """step_recognize.py — recover a featuretree IR from a STEP B-rep (feature RECOGNITION).
 
 A STEP file is a dumb B-rep: geometry, no feature tree. You cannot *convert* it to an IR;
-you can only *infer* one. This recognizes the 2.5D-prismatic class the IR was built for —
-a flat base profile extruded along Z, plus circular through/blind holes — by classifying
-the solid's faces (planar base, concave cylinders = holes) with the OpenCASCADE kernel.
+you can only *infer* one. The insight this leans on: **most machined/printed parts are a 2D
+profile extruded along some axis** (plus holes). So the core intelligence is CROSS-SECTIONAL —
+find the axis the solid is a prismatic extrusion along (every face is planar-perpendicular,
+planar-parallel, or a cylinder parallel to it), rotate that axis onto Z, and recover the profile
++ through/blind holes. Orientation-agnostic: a part extruded along X or Y is found the same way.
 
-The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit
-and its volume + bounding box are compared to the original STEP. So every result is either
-"verified" (provably the same solid, Δvol≈0) or "partial/unrecognized" with the residual
-reported — in which case the caller should fall back to importing the STEP as one solid.
-Out of scope (and surfaced as residual, never silently wrong): fillets/chamfers, non-Z
-extrusion, revolves / lofts / sweeps / freeform, and additive bosses on top of the base.
+The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit and
+its volume + (rotation-tolerant) bounding box are compared to the original STEP. So every result
+is either "verified" (provably the same solid, Δvol≈0) or "partial/unrecognized" with the residual
+reported — in which case the caller should fall back to importing the STEP as one solid. Out of
+scope (surfaced as residual, never silently wrong): fillets/chamfers, revolves / lofts / sweeps /
+freeform, additive bosses, and profiles whose boundary has ARCS (straight-edge polygons + circular
+holes only for now — arc-wire support is the next increment).
 
     python step_recognize.py part.step [--emit part.ir.json]
     from step_recognize import recognize;  spec, report = recognize("part.step")
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 
-from build123d import GeomType, Vector, import_step
+from build123d import Axis, GeomType, Vector, import_step
 
 import ir as IR
 import b3d_emit
 
 EPS = 1e-3
+ANG = 1e-2           # direction tolerance: |dot|<ANG == perpendicular, >1-ANG == parallel
 VOL_TOL = 0.005      # 0.5% volume agreement -> "verified"
 DIM_TOL = 0.05       # mm bbox-size agreement
+
+
+# --- cross-sectional intelligence: is this solid a 2D profile extruded along SOME axis? ---------
+# A prismatic extrusion along axis a has EVERY face either planar-perpendicular to a (an end cap),
+# planar-parallel to a (a flat side wall), or cylindrical with its axis parallel to a (a rounded
+# wall or a through hole). Any other face (angled plane, cone/sphere/torus/bspline) rules a out.
+# We find such an axis, rotate it onto Z, and then the Z-prismatic profile+holes logic applies to
+# ANY orientation — the general "most parts are an extrude of a 2D wire" case.
+
+def _cyl_axis(face):
+    ces = face.edges().filter_by(GeomType.CIRCLE)
+    if len(ces) < 2:
+        return None
+    a, b = ces[0].arc_center, ces[1].arc_center
+    d = Vector(b.X - a.X, b.Y - a.Y, b.Z - a.Z)
+    return d.normalized() if d.length > EPS else None
+
+
+def _is_extrude_along(solid, a):
+    for f in solid.faces():
+        gt = f.geom_type
+        if gt == GeomType.PLANE:
+            d = abs(_normal(f).normalized().dot(a))
+            if not (d < ANG or d > 1 - ANG):
+                return False                      # angled wall -> not a prism along a
+        elif gt == GeomType.CYLINDER:
+            ax = _cyl_axis(f)
+            if ax is None or abs(ax.dot(a)) < 1 - ANG:
+                return False                      # cylinder axis not along a
+        else:
+            return False                          # cone/sphere/torus/bspline -> not a simple extrude
+    return True
+
+
+def _find_extrude_axis(solid):
+    """Return a unit axis the solid is a prismatic extrusion along, or None. Prefer Z, then Y, X,
+    then any face-derived direction (so an off-axis part is still found)."""
+    cands = [Vector(0, 0, 1), Vector(0, 1, 0), Vector(1, 0, 0)]
+    for f in solid.faces().filter_by(GeomType.PLANE):
+        cands.append(_normal(f).normalized())
+    for f in solid.faces().filter_by(GeomType.CYLINDER):
+        ax = _cyl_axis(f)
+        if ax:
+            cands.append(ax)
+    seen = []
+    for a in cands:
+        if a.length < EPS or any(abs(a.dot(u)) > 1 - ANG for u in seen):
+            continue
+        seen.append(a)
+        if _is_extrude_along(solid, a):
+            return a
+    return None
+
+
+def _align_to_z(solid, a):
+    """Rotate the solid so extrude axis `a` lands on +Z (the IR's extrude direction)."""
+    a = a.normalized()
+    z = Vector(0, 0, 1)
+    if abs(a.dot(z)) > 1 - ANG:
+        return solid                              # already along Z
+    axis_dir = a.cross(z)
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, a.dot(z)))))
+    return solid.rotate(Axis((0, 0, 0), axis_dir.to_tuple()), angle)
 
 
 def _r2(v):
@@ -82,12 +150,19 @@ def _close(a, b):
 def recognize(step_path, name=None, verify=True):
     """STEP file -> (IR spec, report). report.verified is True iff the re-emitted IR
     reproduces the STEP's volume + bbox within tolerance."""
-    solid = import_step(str(step_path))
-    solid = solid.solid() if hasattr(solid, "solid") else solid
-    bb = solid.bounding_box()
-    base_z, top_z, thick = bb.min.Z, bb.max.Z, bb.size.Z
+    orig = import_step(str(step_path))
+    orig = orig.solid() if hasattr(orig, "solid") else orig
     name = name or Path(step_path).stem
     warnings = []
+
+    # cross-section intelligence: find the axis this solid is a prismatic extrusion along (any
+    # orientation) and rotate it onto Z, so the Z-profile+holes logic below is axis-agnostic.
+    axis = _find_extrude_axis(orig)
+    solid = _align_to_z(orig, axis) if axis is not None else orig
+    if axis is not None and abs(axis.dot(Vector(0, 0, 1))) < 1 - ANG:
+        warnings.append(f"extrude axis {tuple(round(c, 3) for c in axis.to_tuple())} -> rotated onto Z")
+    bb = solid.bounding_box()
+    base_z, top_z, thick = bb.min.Z, bb.max.Z, bb.size.Z
 
     # 1. BASE: the largest Z-normal planar face at min z -> outline, extruded `thick` up.
     planar = solid.faces().filter_by(GeomType.PLANE)
@@ -123,9 +198,10 @@ def recognize(step_path, name=None, verify=True):
     spec = IR.part(name, *feats)
 
     report = {"name": name, "features": len(feats), "through_holes": len(through),
-              "blind_holes": len(blind), "warnings": warnings, "verified": None}
+              "blind_holes": len(blind), "warnings": warnings, "verified": None,
+              "extrude_axis": tuple(round(c, 3) for c in axis.to_tuple()) if axis is not None else None}
     if verify:
-        report.update(_verify(spec, solid))
+        report.update(_verify(spec, orig))
     return spec, report
 
 
@@ -167,8 +243,11 @@ def _verify(spec, solid):
     except Exception as e:
         return {"verified": False, "reason": f"re-emit failed: {e}", "vol_orig": round(solid.volume, 1)}
     ob, nb = solid.bounding_box(), part.bounding_box()
+    # sorted bbox sizes: rotation-tolerant (the IR is rebuilt with the extrude axis on Z, which may
+    # permute the original's axes)
+    os_, ns_ = sorted([ob.size.X, ob.size.Y, ob.size.Z]), sorted([nb.size.X, nb.size.Y, nb.size.Z])
     dvol = abs(res["volume"] - solid.volume)
-    dsize = max(abs(ob.size.X - nb.size.X), abs(ob.size.Y - nb.size.Y), abs(ob.size.Z - nb.size.Z))
+    dsize = max(abs(o - n) for o, n in zip(os_, ns_))
     ok = dvol <= VOL_TOL * solid.volume and dsize <= DIM_TOL
     return {"verified": bool(ok), "vol_orig": round(solid.volume, 1), "vol_ir": res["volume"],
             "dvol": round(dvol, 2), "dvol_pct": round(100 * dvol / max(solid.volume, 1e-9), 2),
@@ -194,6 +273,12 @@ def _fixtures(tmp):
         p = Path(tmp) / f"{nm}.step"
         export_step(part, str(p))
         paths[nm] = str(p)
+    # OFF-AXIS: the L-bracket extruded along Z, rotated 90deg about X so it's extruded along Y —
+    # the axis-agnostic recognizer must still find it and verify.
+    lbr, _ = b3d_emit.emit(IR.SAMPLES["poly"]())
+    p = Path(tmp) / "off_axis.step"
+    export_step(lbr.rotate(Axis((0, 0, 0), (1, 0, 0)), 90), str(p))
+    paths["off_axis"] = str(p)
     return paths
 
 
@@ -201,10 +286,11 @@ def selftest():
     import tempfile
     paths = _fixtures(tempfile.mkdtemp())
     problems = []
-    for nm in ("plate", "poly", "disc_hole"):        # in scope -> must VERIFY at Δ≈0
+    for nm in ("plate", "poly", "disc_hole", "off_axis"):   # in scope -> must VERIFY at Δ≈0
         _, rep = recognize(paths[nm])
+        ax = rep.get("extrude_axis")
         print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "
-              f"vol Δ{rep['dvol_pct']}%  (thru={rep['through_holes']})")
+              f"vol Δ{rep['dvol_pct']}%  (thru={rep['through_holes']}, axis={ax})")
         if not rep["verified"]:
             problems.append(f"{nm}: expected VERIFIED, got Δ{rep['dvol_pct']}%")
     _, rep = recognize(paths["boss"])                # out of scope -> must be flagged PARTIAL
