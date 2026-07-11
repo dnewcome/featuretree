@@ -25,6 +25,7 @@ def sketch(name, plane="XY", circles=(), rects=(), polys=(), on=None):
         polys:   [wire, ...] where wire = [(x, y), ...]  (closed automatically).
                  The FIRST poly is the outer profile; any following polys are holes
                  in it — so an extruded profile-with-holes is one sketch -> one pad.
+        plane: "XY" (default) or "XZ" — use "XZ" for a revolve profile (x = radius, z = axial).
         on: None -> the `plane`; or a face QUERY {"face_of": feature, "side": "top"|"bottom"}
             (coords stay global; the emitter maps them into the face's local frame).
     """
@@ -48,6 +49,23 @@ def fillet(name, radius, select):
     """Round edges chosen by a QUERY (resolved against live geometry at build time,
     never stored kernel edge ids). e.g. select={"circles": "top_outer"}."""
     return {"kind": "fillet", "name": name, "radius": radius, "select": select}
+
+
+def revolve(name, sketch, angle=360.0):
+    """Revolve a profile sketch about the Z axis by `angle` degrees. The sketch must lie in a
+    plane CONTAINING the axis — the XZ plane (plane="XZ"), with all radii x >= 0 — and its `polys`
+    give the cross-section. This is the primitive round parts need (wheels, bosses, nozzles) that
+    sketch/pad can't: a body of revolution."""
+    return {"kind": "revolve", "name": name, "sketch": sketch, "angle": angle}
+
+
+def polar_pocket(name, radius, length, mount_r, z=0.0, count=4, phase=0.0):
+    """Cut `count` cylindrical pockets evenly spaced about the Z axis, each of `radius` and
+    `length`, its axis TANGENT to the circle of radius `mount_r` at axial height `z`, the ring
+    rotated by `phase` degrees. Models a ring of roller pockets (omni wheel), a pin circle on a
+    hub, etc. — a polar pattern of a tangent bore that plain pocket() (axial only) can't place."""
+    return {"kind": "polar_pocket", "name": name, "radius": radius, "length": length,
+            "mount_r": mount_r, "z": z, "count": count, "phase": phase}
 
 
 def part(name, *features):

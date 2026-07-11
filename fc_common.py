@@ -52,6 +52,8 @@ def result(doc):
                 params[o.Label]["type"] = str(o.Type)
         elif o.TypeId == "PartDesign::Fillet":
             params[o.Label] = {"radius": round(float(o.Radius), 4)}
+        elif o.TypeId == "PartDesign::Revolution":
+            params[o.Label] = {"angle": round(float(o.Angle), 4)}
         elif o.TypeId == "Sketcher::SketchObject":
             radii = [round(g.Radius, 4) for g in o.Geometry if isinstance(g, Part.Circle)]
             if radii:

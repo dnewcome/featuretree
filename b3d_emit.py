@@ -18,19 +18,28 @@ live geometry — never a stored kernel id).
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 
-from build123d import (Align, Axis, Circle, GeomType, Plane, Polygon, Pos, Rectangle,
-                       export_stl, extrude, fillet)
+from build123d import (Align, Axis, Circle, Cylinder, GeomType, Plane, Polygon, Pos, Rectangle,
+                       Rot, export_stl, extrude, fillet, revolve)
 
 _BIG = 1.0e4  # a through-cut overshoot (mm), clipped by the actual solid
 
 
-def _sketch_faces(f, z0):
-    """The IR sketch's closed regions as build123d faces, placed on the z=z0 plane.
-    circles/rects are each their own region; polys[0] is an outer profile with polys[1:]
-    as holes in it (one region). Coordinates are global x,y (the emitter only sets z)."""
+def _sketch_faces(f, z0, plane="XY"):
+    """The IR sketch's closed regions as build123d faces. On XY: circles/rects each their own
+    region, polys[0] an outer profile with polys[1:] as holes, all at z=z0. On XZ (a revolve
+    profile): polys placed in the XZ plane (x = radius, z = axial)."""
+    if plane == "XZ":
+        faces = []
+        for poly in f.get("polys", []):
+            pts = [tuple(p) for p in poly]
+            if len(pts) > 1 and pts[0] == pts[-1]:
+                pts = pts[:-1]
+            faces.append(Plane.XZ * Polygon(*pts, align=None))   # (x,y)->(radius, axial)
+        return faces
     faces = []
     for (cx, cy, r) in f.get("circles", []):
         faces.append(Pos(cx, cy, z0) * Circle(r))
@@ -66,7 +75,8 @@ def emit(spec):
     """Build the IR `spec` into a build123d Solid. Returns (part, result_dict) where the
     result mirrors fc_common.result (tree / volume / editable params) for cross-backend parity."""
     part = None
-    sketches = {}          # name -> (faces, z0)  consumed by the next pad/pocket
+    sketches = {}          # name -> (faces, z0)  consumed by the next pad/pocket/revolve
+    planes = {}            # name -> "XY" | "XZ"
     tree = []
     params = {}
 
@@ -79,11 +89,14 @@ def emit(spec):
                 if f.get("rects") or f.get("polys"):
                     raise ValueError("face-attached sketches support circles only (v0)")
                 z0 = _face_z(part, on.get("side", "top"))
+                plane = "XY"
             else:
-                if f.get("plane", "XY") != "XY":
-                    raise ValueError("unattached sketches must be on XY (v0)")
+                plane = f.get("plane", "XY")
+                if plane not in ("XY", "XZ"):
+                    raise ValueError(f"sketch plane must be XY or XZ (v0), got {plane}")
                 z0 = 0.0
-            sketches[f["name"]] = (_sketch_faces(f, z0), z0)
+            sketches[f["name"]] = (_sketch_faces(f, z0, plane), z0)
+            planes[f["name"]] = plane
             radii = [c[2] for c in f.get("circles", [])]
             if radii:
                 params[f["name"]] = {"radii": [round(r, 4) for r in radii]}
@@ -122,6 +135,30 @@ def emit(spec):
                 raise ValueError(f"fillet '{f['name']}' selected no edges")
             part = fillet(edges, f["radius"])
             params[f["name"]] = {"radius": round(float(f["radius"]), 4)}
+        elif kind == "revolve":
+            faces, _ = sketches[f["sketch"]]
+            if planes.get(f["sketch"]) != "XZ":
+                raise ValueError("revolve needs an XZ-plane profile sketch")
+            angle = f.get("angle", 360.0)
+            solid = None
+            for fc in faces:
+                s = revolve(fc, Axis.Z, revolution_arc=angle)
+                solid = s if solid is None else solid + s
+            part = solid if part is None else part + solid
+            params[f["name"]] = {"angle": round(float(angle), 4)}
+        elif kind == "polar_pocket":
+            n, r, L = int(f["count"]), f["radius"], f["length"]
+            mr, z0p, phase = f["mount_r"], f.get("z", 0.0), f.get("phase", 0.0)
+            cutter = None
+            for i in range(n):
+                a = phase + 360.0 * i / n
+                px, py = mr * math.cos(math.radians(a)), mr * math.sin(math.radians(a))
+                # Cylinder along +Z, centered; Rot(90 about X) lays it along +Y, Rot(a about Z)
+                # points it along the tangent at azimuth a; Pos drops it on the roller station.
+                cyl = Pos(px, py, z0p) * Rot(0, 0, a) * Rot(90, 0, 0) * Cylinder(r, L)
+                cutter = cyl if cutter is None else cutter + cyl
+            part = part - cutter
+            params[f["name"]] = {"count": n, "radius": round(float(r), 4)}
         else:
             raise ValueError(f"unknown feature kind: {kind}")
 

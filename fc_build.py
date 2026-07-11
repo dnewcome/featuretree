@@ -10,6 +10,7 @@ edit in FreeCAD can be matched back by name (see fc_read.py).
 """
 
 import json
+import math
 import os
 import sys
 
@@ -64,8 +65,12 @@ def build(spec, out_path):
                     lp = inv.multVec(App.Vector(cx, cy, zref))
                     sk.addGeometry(Part.Circle(App.Vector(lp.x, lp.y, 0), App.Vector(0, 0, 1), r), False)
             else:
-                if f["plane"] != "XY":
-                    raise ValueError("unattached sketches must be on XY (v0)")
+                plane = f.get("plane", "XY")
+                if plane == "XZ":                     # revolve profile: local (u,v) -> global (x=u, z=v)
+                    sk.Placement = App.Placement(App.Vector(0, 0, 0),
+                                                 App.Rotation(App.Vector(1, 0, 0), 90))
+                elif plane != "XY":
+                    raise ValueError("unattached sketches must be on XY or XZ (v0)")
                 for (cx, cy, r) in f["circles"]:
                     sk.addGeometry(Part.Circle(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), r), False)
                 for (w, h, cx, cy) in f["rects"]:
@@ -99,6 +104,29 @@ def build(spec, out_path):
             fl.Base = (tip, edges)
             fl.Radius = f["radius"]
             tip = fl
+        elif kind == "revolve":
+            rev = body.newObject("PartDesign::Revolution", f["name"])
+            rev.Label = f["name"]
+            rev.Profile = sketches[f["sketch"]]
+            rev.ReferenceAxis = (sketches[f["sketch"]], ["V_Axis"])   # the XZ sketch's V axis = global Z
+            rev.Angle = f.get("angle", 360.0)
+            rev.Midplane = False
+            tip = rev
+        elif kind == "polar_pocket":
+            n, r, L = int(f["count"]), f["radius"], f["length"]
+            mr, zc, phase = f["mount_r"], f.get("z", 0.0), f.get("phase", 0.0)
+            for i in range(n):
+                a = phase + 360.0 * i / n
+                cyl = body.newObject("PartDesign::SubtractiveCylinder", f"{f['name']}_{i}")
+                cyl.Label = f"{f['name']}_{i}"
+                cyl.Radius = r
+                cyl.Height = L
+                # cylinder axis (local +Z) -> tangent at azimuth a; center it on the roller station
+                rot = App.Rotation(App.Vector(0, 0, 1), a).multiply(App.Rotation(App.Vector(1, 0, 0), 90))
+                axis = rot.multVec(App.Vector(0, 0, 1))
+                ctr = App.Vector(mr * math.cos(math.radians(a)), mr * math.sin(math.radians(a)), zc)
+                cyl.Placement = App.Placement(ctr - axis * (L / 2.0), rot)
+                tip = cyl
         else:
             raise ValueError(f"unknown feature kind: {kind}")
         doc.recompute()
