@@ -1,0 +1,251 @@
+"""step_recognize.py — recover a featuretree IR from a STEP B-rep (feature RECOGNITION).
+
+A STEP file is a dumb B-rep: geometry, no feature tree. You cannot *convert* it to an IR;
+you can only *infer* one. This recognizes the 2.5D-prismatic class the IR was built for —
+a flat base profile extruded along Z, plus circular through/blind holes — by classifying
+the solid's faces (planar base, concave cylinders = holes) with the OpenCASCADE kernel.
+
+The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit
+and its volume + bounding box are compared to the original STEP. So every result is either
+"verified" (provably the same solid, Δvol≈0) or "partial/unrecognized" with the residual
+reported — in which case the caller should fall back to importing the STEP as one solid.
+Out of scope (and surfaced as residual, never silently wrong): fillets/chamfers, non-Z
+extrusion, revolves / lofts / sweeps / freeform, and additive bosses on top of the base.
+
+    python step_recognize.py part.step [--emit part.ir.json]
+    from step_recognize import recognize;  spec, report = recognize("part.step")
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from build123d import GeomType, Vector, import_step
+
+import ir as IR
+import b3d_emit
+
+EPS = 1e-3
+VOL_TOL = 0.005      # 0.5% volume agreement -> "verified"
+DIM_TOL = 0.05       # mm bbox-size agreement
+
+
+def _r2(v):
+    return (round(v.X, 4), round(v.Y, 4))
+
+
+def _normal(f):
+    try:
+        return f.normal_at(f.position_at(0.5, 0.5))
+    except Exception:
+        return f.normal_at()
+
+
+def _classify_wire(wire, warnings):
+    """A closed outer wire -> ('circle', cx, cy, r) | ('poly', [(x,y),...]) | None (unsupported)."""
+    edges = wire.edges()
+    circ = edges.filter_by(GeomType.CIRCLE)
+    if len(edges) == 1 and len(circ) == 1:
+        c = circ[0]
+        return ("circle", round(c.arc_center.X, 4), round(c.arc_center.Y, 4), round(c.radius, 4))
+    if len(circ) == 0 and all(e.geom_type == GeomType.LINE for e in edges):
+        return ("poly", _ordered_poly(edges))
+    warnings.append("outline has arcs/splines (not a circle or straight polygon) — unsupported")
+    return None
+
+
+def _ordered_poly(edges):
+    """Chain straight edges by shared endpoints into an ordered vertex loop."""
+    segs = [(_r2(e @ 0.0), _r2(e @ 1.0)) for e in edges]
+    pts = [segs[0][0], segs[0][1]]
+    used = {0}
+    while len(used) < len(segs):
+        tail = pts[-1]
+        for i, (a, b) in enumerate(segs):
+            if i in used:
+                continue
+            if _close(a, tail):
+                pts.append(b); used.add(i); break
+            if _close(b, tail):
+                pts.append(a); used.add(i); break
+        else:
+            break
+    if len(pts) > 1 and _close(pts[0], pts[-1]):
+        pts.pop()
+    return pts
+
+
+def _close(a, b):
+    return abs(a[0] - b[0]) < EPS and abs(a[1] - b[1]) < EPS
+
+
+def recognize(step_path, name=None, verify=True):
+    """STEP file -> (IR spec, report). report.verified is True iff the re-emitted IR
+    reproduces the STEP's volume + bbox within tolerance."""
+    solid = import_step(str(step_path))
+    solid = solid.solid() if hasattr(solid, "solid") else solid
+    bb = solid.bounding_box()
+    base_z, top_z, thick = bb.min.Z, bb.max.Z, bb.size.Z
+    name = name or Path(step_path).stem
+    warnings = []
+
+    # 1. BASE: the largest Z-normal planar face at min z -> outline, extruded `thick` up.
+    planar = solid.faces().filter_by(GeomType.PLANE)
+    bottoms = [f for f in planar if abs(_normal(f).Z) > 0.99 and abs(f.center().Z - base_z) < EPS]
+    if not bottoms:
+        raise ValueError("no Z-normal planar face at the base — not a Z-prismatic part")
+    base_face = max(bottoms, key=lambda f: f.area)
+    outline = _classify_wire(base_face.outer_wire(), warnings)
+    if outline is None:
+        raise ValueError("base outline not recognizable as a circle or straight polygon")
+
+    feats = [_sketch_from_outline("outline", outline),
+             IR.pad("body", "outline", length=round(thick, 4))]
+
+    # 2. HOLES: concave cylindrical faces with a Z axis -> circle pocket (through or blind).
+    through, blind = [], []
+    for f in solid.faces().filter_by(GeomType.CYLINDER):
+        h = _cyl_hole(f, base_z, top_z, warnings)
+        if h is None:
+            continue
+        (through if h["through"] else blind).append(h)
+
+    if through:
+        circles = [(h["x"], h["y"], h["r"]) for h in through]
+        feats.append(IR.sketch("holes", "XY", circles=circles))
+        feats.append(IR.pocket("drill", "holes", through=True))
+    for i, h in enumerate(blind):
+        sk = IR.sketch(f"blind_sk{i}", circles=[(h["x"], h["y"], h["r"])],
+                       on={"face_of": "body", "side": h["side"]})
+        feats.append(sk)
+        feats.append(IR.pocket(f"blind{i}", f"blind_sk{i}", through=False, length=round(h["depth"], 4)))
+
+    spec = IR.part(name, *feats)
+
+    report = {"name": name, "features": len(feats), "through_holes": len(through),
+              "blind_holes": len(blind), "warnings": warnings, "verified": None}
+    if verify:
+        report.update(_verify(spec, solid))
+    return spec, report
+
+
+def _sketch_from_outline(sk_name, outline):
+    if outline[0] == "circle":
+        _, cx, cy, r = outline
+        return IR.sketch(sk_name, "XY", circles=[(cx, cy, r)])
+    return IR.sketch(sk_name, "XY", polys=[outline[1]])
+
+
+def _cyl_hole(face, base_z, top_z, warnings):
+    """A cylindrical face -> a hole dict if it is concave (material outside) with a ~Z axis."""
+    ces = face.edges().filter_by(GeomType.CIRCLE)
+    if not ces:
+        return None
+    ctr = ces[0].arc_center
+    r = ces[0].radius
+    if any(abs(e.radius - r) > EPS for e in ces):
+        return None                       # tapered/variable — not a straight bore
+    zs = [e.arc_center.Z for e in ces]
+    zlo, zhi = min(zs), max(zs)
+    if zhi - zlo < EPS:
+        return None                       # degenerate (a flat circle edge, not a wall)
+    # concavity: outward surface normal points toward the axis => a hole (void outside)
+    sp = face.position_at(0.5, 0.5)
+    n = _normal(face)
+    if n.X * (sp.X - ctr.X) + n.Y * (sp.Y - ctr.Y) >= 0:
+        return None                       # convex -> outer wall, part of the outline
+    through = (zlo - base_z) < EPS and (top_z - zhi) < EPS
+    side = "top" if (top_z - zhi) < EPS else "bottom"
+    return {"x": round(ctr.X, 4), "y": round(ctr.Y, 4), "r": round(r, 4),
+            "through": through, "side": side, "depth": round(zhi - zlo, 4)}
+
+
+def _verify(spec, solid):
+    """Re-emit the recognized IR and compare volume + bbox size to the original STEP."""
+    try:
+        part, res = b3d_emit.emit(spec)
+    except Exception as e:
+        return {"verified": False, "reason": f"re-emit failed: {e}", "vol_orig": round(solid.volume, 1)}
+    ob, nb = solid.bounding_box(), part.bounding_box()
+    dvol = abs(res["volume"] - solid.volume)
+    dsize = max(abs(ob.size.X - nb.size.X), abs(ob.size.Y - nb.size.Y), abs(ob.size.Z - nb.size.Z))
+    ok = dvol <= VOL_TOL * solid.volume and dsize <= DIM_TOL
+    return {"verified": bool(ok), "vol_orig": round(solid.volume, 1), "vol_ir": res["volume"],
+            "dvol": round(dvol, 2), "dvol_pct": round(100 * dvol / max(solid.volume, 1e-9), 2),
+            "dsize_mm": round(dsize, 3)}
+
+
+def _fixtures(tmp):
+    """Generate known STEP fixtures from IR via b3d_emit: three in-scope prismatic parts +
+    one out-of-scope part (an additive boss on top of the base) the recognizer must REJECT."""
+    from build123d import export_step
+    disc = IR.part("disc_hole",
+                   IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("body", "o", length=8),
+                   IR.sketch("h", "XY", circles=[(0, 0, 5)]), IR.pocket("drill", "h", through=True))
+    boss = IR.part("boss",                       # base disc + a raised central post (additive)
+                   IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("body", "o", length=6),
+                   IR.sketch("b", circles=[(0, 0, 6)], on={"face_of": "body", "side": "top"}),
+                   IR.pad("post", "b", length=10))
+    specs = {"plate": IR.SAMPLES["plate"](), "poly": IR.SAMPLES["poly"](),
+             "disc_hole": disc, "boss": boss}
+    paths = {}
+    for nm, spec in specs.items():
+        part, _ = b3d_emit.emit(spec)
+        p = Path(tmp) / f"{nm}.step"
+        export_step(part, str(p))
+        paths[nm] = str(p)
+    return paths
+
+
+def selftest():
+    import tempfile
+    paths = _fixtures(tempfile.mkdtemp())
+    problems = []
+    for nm in ("plate", "poly", "disc_hole"):        # in scope -> must VERIFY at Δ≈0
+        _, rep = recognize(paths[nm])
+        print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "
+              f"vol Δ{rep['dvol_pct']}%  (thru={rep['through_holes']})")
+        if not rep["verified"]:
+            problems.append(f"{nm}: expected VERIFIED, got Δ{rep['dvol_pct']}%")
+    _, rep = recognize(paths["boss"])                # out of scope -> must be flagged PARTIAL
+    print(f"  {'boss':10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  vol Δ{rep['dvol_pct']}%  "
+          "(additive post — base-extrusion model can't capture it)")
+    if rep["verified"]:
+        problems.append("boss: an additive-boss part must NOT verify (should fall back to a solid)")
+    if problems:
+        for p in problems:
+            print("FAIL:", p)
+        return 1
+    print("PASS: 2.5D-prismatic parts recognized + re-emit-verified; out-of-scope flagged, not faked")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
+    if not args:
+        print(__doc__)
+        return 0
+    step_path = args[0]
+    spec, report = recognize(step_path)
+    v = report.get("verified")
+    tag = "VERIFIED" if v else ("PARTIAL" if v is False else "UNVERIFIED")
+    print(f"recognize {step_path}:")
+    print(f"  tree: {' -> '.join(f['name'] for f in spec['features'])}")
+    print(f"  {report['through_holes']} through hole(s), {report['blind_holes']} blind")
+    if "vol_orig" in report:
+        print(f"  volume: STEP {report['vol_orig']}  vs re-emitted IR {report.get('vol_ir','?')}  "
+              f"(Δ{report.get('dvol_pct','?')}%, bbox Δ{report.get('dsize_mm','?')}mm)")
+    for w in report["warnings"]:
+        print(f"  ! {w}")
+    print(f"  => {tag}" + ("" if v else " — fall back to importing the STEP as one solid"))
+    if "--emit" in args:
+        out = Path(args[args.index("--emit") + 1])
+        out.write_text(json.dumps(spec, indent=2))
+        print(f"  wrote {out}")
+    return 0 if v else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

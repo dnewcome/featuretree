@@ -75,6 +75,13 @@ The same IR also renders to a **build123d Solid** in-process (`b3d_emit.emit(spe
 no FreeCAD. Same OCCT kernel, so identical geometry — the `plate` sample is 11497.3 mm³ from both.
 One IR → the editable tree AND a watertight solid to mesh/sim/interference-check; no second model.
 
+## STEP → IR (feature recognition)
+`step_recognize.recognize(step_path) -> (spec, report)` INFERS an IR from a dumb STEP B-rep for the
+2.5D-prismatic class (planar base → pad, concave Z-cylinders → through/blind pockets). Self-verified:
+the IR is re-emitted via `b3d_emit` and volume/bbox compared to the STEP — `report["verified"]` is
+True (Δ≈0) or it's flagged PARTIAL (fall back to a single solid). Out of scope: fillets, bosses,
+revolves/lofts/sweeps/freeform (rejected, never faked). `python3 step_recognize.py f.step --emit x.ir.json`.
+
 ## Bridging IN from build123d (reverse)
 build123d bakes operations into a final solid, so you can't extract its "tree". Instead, author
 the part's operations as IR using the **same named constants** the build123d script uses (profile

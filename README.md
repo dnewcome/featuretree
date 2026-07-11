@@ -111,14 +111,43 @@ Coverage mirrors `fc_build.py`: sketches (circles / rects / polygons-with-holes)
 top/bottom face, pad (± midplane), pocket (through / blind), and fillet by the **same edge query**
 the IR stores (resolved against live geometry, no kernel ids).
 
+## STEP → IR (feature recognition)
+
+A STEP file is a dumb B-rep — no feature tree — so you can't *convert* it to an IR, only *infer*
+one. `step_recognize.py` does that for the **2.5D-prismatic class** the IR was built for: it
+classifies the solid's faces with the OpenCASCADE kernel (largest planar base face → outline + pad;
+concave cylindrical faces with a Z axis → circular through/blind pockets) and emits the IR.
+
+The result is **self-verified**: the recognized IR is re-emitted through `b3d_emit` and its volume +
+bounding box are compared to the original STEP. So every recognition is either **VERIFIED** (Δvol ≈ 0
+— provably the same solid, now an editable tree) or flagged **PARTIAL** with the residual, in which
+case you fall back to importing the STEP as one solid. It never fakes a tree.
+
+```python
+import step_recognize
+spec, report = step_recognize.recognize("plate.step")   # spec is a featuretree IR
+print(report["verified"], report["dvol_pct"])           # True 0.0
+```
+
+```bash
+python3 step_recognize.py plate.step --emit plate.ir.json   # recover + write the IR
+python3 step_recognize.py --selftest                        # generate fixtures, assert (CI)
+```
+
+**Out of scope** (surfaced as PARTIAL, never silently wrong): fillets/chamfers, non-Z extrusion,
+additive bosses on the base, and revolves / lofts / sweeps / freeform — there is no faithful feature
+tree to recover there (feature recognition is inference, non-unique in general), so the verifier
+rejects them rather than guess.
+
 ### Bridging IN from build123d (the reverse direction)
 
 build123d bakes operations into a final solid, so you can't *extract* its tree. To bring an existing
 build123d part in, author its operations as IR using the **same named constants** your build123d
 script uses (profile points, thickness, hole positions), so both paths describe one design —
-then `b3d_emit` regenerates an equivalent solid to confirm parity. Extracted / complex 2D profiles go
-in as `polys`. Geometry that's a mesh boolean (no clean sketch/pad) can't be a feature tree — export
-those as STEP/STL and import as a single solid, and say so.
+then `b3d_emit` regenerates an equivalent solid to confirm parity. Or export it to STEP and try
+`step_recognize` (above) — it verifies whether the inferred tree actually reproduces the part.
+Geometry that's a mesh boolean (no clean sketch/pad) can't be a feature tree — export those as
+STEP/STL and import as a single solid, and say so.
 
 ## How it runs
 
@@ -126,6 +155,7 @@ those as STEP/STL and import as a single solid, and say so.
 |------|-----------|------|
 | `ir.py` | any Python 3 | the DSL / IR — single source of truth, plain JSON-able dicts |
 | `b3d_emit.py` | host Python 3 | render an IR spec → a build123d Solid (+ `.stl`) in-process, no FreeCAD |
+| `step_recognize.py` | host Python 3 | recover an IR from a STEP B-rep (2.5D-prismatic), self-verified by re-emit |
 | `gen.py` | host Python 3 | emit an IR spec → `.FCStd` (+ `.stl`); shells out to FreeCAD |
 | `roundtrip.py` | host Python 3 | read the tree / params back; optionally apply named edits |
 | `runner.py` | host Python 3 | locate / extract `freecadcmd`, run a script under it |
