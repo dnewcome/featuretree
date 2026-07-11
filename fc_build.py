@@ -132,16 +132,37 @@ def build(spec, out_path):
         doc.recompute()
 
     doc.recompute()
-    # A headless (freecadcmd) doc has no GUI visibility state, so it opens ALL-HIDDEN in the
-    # FreeCAD GUI. Set App-level Visibility (persists to the file, the GUI honours it): show the
-    # Body + final tip solid, hide sketches/intermediate features.
+    # freecadcmd writes NO GuiDocument.xml, and the GUI stores per-object display state THERE (not
+    # in Document.xml's App Visibility) — so without it every object opens hidden. Set the App
+    # Visibility (show Body + final tip solid, hide sketches/intermediates) AND inject a matching
+    # GuiDocument.xml so the GUI actually honours it.
+    visible = {body.Name, getattr(tip, "Name", None)}
     for o in doc.Objects:
         if hasattr(o, "Visibility"):
-            o.Visibility = (o is body or o is tip)
+            o.Visibility = o.Name in visible
     doc.saveAs(out_path)
+    _write_gui_document(out_path, [o.Name for o in doc.Objects], visible)
     stl = out_path[:-6] + ".stl" if out_path.endswith(".FCStd") else out_path + ".stl"
     body.Shape.exportStl(stl)
     return fc_common.result(doc)
+
+
+def _write_gui_document(out_path, names, visible):
+    """Inject a GuiDocument.xml (the file the FreeCAD GUI reads for per-object display state) into
+    the .FCStd zip, so freecadcmd output doesn't open all-hidden. Sets each ViewProvider Visibility."""
+    import zipfile
+    vps = []
+    for name in names:
+        val = "true" if name in visible else "false"
+        vps.append('<ViewProvider name="%s" expanded="0">'
+                   '<Properties Count="1" TransientCount="0">'
+                   '<Property name="Visibility" type="App::PropertyBool" status="1">'
+                   '<Bool value="%s"/></Property></Properties></ViewProvider>' % (name, val))
+    gui = ("<?xml version='1.0' encoding='utf-8'?>\n<Document SchemaVersion=\"1\">\n"
+           '<ViewProviderData Count="%d">\n%s\n</ViewProviderData>\n</Document>\n'
+           % (len(vps), "\n".join(vps)))
+    with zipfile.ZipFile(out_path, "a", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("GuiDocument.xml", gui)
 
 
 # freecadcmd execs this file but not as __main__, so run at top level.
