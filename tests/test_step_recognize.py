@@ -5,6 +5,7 @@ true. The recognizer self-verifies by re-emit, so `verified` is the headline ass
 pin the method (extrude vs revolve), hole counts, and axis where they matter.
 """
 import math
+from pathlib import Path
 
 import pytest
 from build123d import (Axis, Box, BuildPart, BuildSketch, Circle, Ellipse, Location, Locations,
@@ -148,6 +149,20 @@ def test_deterministic(tmp_path):
 def test_verify_false_when_disabled_reports_none(tmp_path):
     _, r = sr.recognize(emit_step(IR.SAMPLES["plate"](), tmp_path), verify=False)
     assert r["verified"] is None and r["method"] == "extrude"
+
+
+def test_nist_ctc01_best_effort_partial():
+    """A real NIST test part (chamfers + cross-holes + multi-level pockets) is beyond a single
+    extrude/revolve. It's recovered best-effort along the dominant axis (outline + vertical holes)
+    but honestly flagged PARTIAL — never faked as verified."""
+    path = Path(__file__).parent / "step" / "nist_ctc_01_asme1_rd.stp"
+    if not path.exists():
+        pytest.skip("NIST fixture not present")
+    spec, rep = sr.recognize(str(path))
+    assert rep["verified"] is False                      # too complex -> honestly not verified
+    assert rep["method"] == "extrude" and rep["extrude_axis"] is not None
+    assert rep["through_holes"] >= 10                    # still recovers the vertical through-holes
+    assert any("not captured" in w for w in rep["warnings"])   # flags the chamfers / cross-holes
 
 
 def test_emit_roundtrip_reproduces_volume(tmp_path):

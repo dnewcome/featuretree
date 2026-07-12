@@ -56,40 +56,50 @@ def _cyl_axis(face):
     return d.normalized() if d.length > EPS else None
 
 
-def _is_extrude_along(solid, a):
+def _extrude_nonconforming(solid, a):
+    """How many faces are NOT consistent with a prismatic extrusion along `a` (angled walls, holes
+    across the axis, freeform). 0 == a clean extrude; a few == a mostly-extruded part with chamfers
+    or cross-holes (recoverable as PARTIAL, the residual flagged)."""
+    bad = 0
     for f in solid.faces():
         gt = f.geom_type
         if gt == GeomType.PLANE:
             d = abs(_normal(f).normalized().dot(a))
             if not (d < ANG or d > 1 - ANG):
-                return False                      # angled wall -> not a prism along a
-        elif gt == GeomType.CYLINDER:
-            ax = _cyl_axis(f)
-            if ax is None or abs(ax.dot(a)) < 1 - ANG:
-                return False                      # cylinder axis not along a
+                bad += 1                          # angled wall (chamfer/draft)
+        elif gt in (GeomType.CYLINDER, GeomType.CONE):
+            ax = _cyl_axis(f)                      # cone (countersink) fine if its axis is along a
+            if ax is not None and abs(ax.dot(a)) < 1 - ANG:
+                bad += 1                          # a hole across the axis (cross-hole)
         else:
-            return False                          # cone/sphere/torus/bspline -> not a simple extrude
-    return True
+            bad += 1                              # sphere/torus/bspline
+    return bad
 
 
 def _find_extrude_axis(solid):
-    """Return a unit axis the solid is a prismatic extrusion along, or None. Prefer Z, then Y, X,
-    then any face-derived direction (so an off-axis part is still found)."""
+    """The axis the solid is (most nearly) a prismatic extrusion along — the one with the FEWEST
+    non-conforming faces. Returns (axis, n_bad); n_bad == 0 is a clean extrude, a few means chamfers/
+    cross-holes (best-effort, PARTIAL). None if even the best axis is mostly non-conforming."""
+    faces = solid.faces()
     cands = [Vector(0, 0, 1), Vector(0, 1, 0), Vector(1, 0, 0)]
-    for f in solid.faces().filter_by(GeomType.PLANE):
+    for f in faces.filter_by(GeomType.PLANE):
         cands.append(_normal(f).normalized())
-    for f in solid.faces().filter_by(GeomType.CYLINDER):
-        ax = _cyl_axis(f)
-        if ax:
-            cands.append(ax)
-    seen = []
+    for gt in (GeomType.CYLINDER, GeomType.CONE):
+        for f in faces.filter_by(gt):
+            ax = _cyl_axis(f)
+            if ax:
+                cands.append(ax)
+    best, best_bad, seen = None, None, []
     for a in cands:
         if a.length < EPS or any(abs(a.dot(u)) > 1 - ANG for u in seen):
             continue
-        seen.append(a)
-        if _is_extrude_along(solid, a):
-            return a
-    return None
+        seen.append(a.normalized())
+        bad = _extrude_nonconforming(solid, a)
+        if best is None or bad < best_bad:
+            best, best_bad = a.normalized(), bad
+    if best is not None and best_bad <= 0.4 * len(faces):   # mostly a prism along `best`
+        return best, best_bad
+    return None, None
 
 
 def _align_to_z(solid, a):
@@ -256,28 +266,36 @@ def _recognize_extrude(orig, name):
     warnings = []
     # cross-section intelligence: find the axis this solid is a prismatic extrusion along (any
     # orientation) and rotate it onto Z, so the Z-profile+holes logic below is axis-agnostic.
-    axis = _find_extrude_axis(orig)
-    solid = _align_to_z(orig, axis) if axis is not None else orig
-    if axis is not None and abs(axis.dot(Vector(0, 0, 1))) < 1 - ANG:
+    axis, n_bad = _find_extrude_axis(orig)
+    if axis is None:
+        raise ValueError("not a prismatic extrusion (mostly angled/curved/cross-axis faces)")
+    solid = _align_to_z(orig, axis)
+    if abs(axis.dot(Vector(0, 0, 1))) < 1 - ANG:
         warnings.append(f"extrude axis {tuple(round(c, 3) for c in axis.to_tuple())} -> rotated onto Z")
+    if n_bad:
+        warnings.append(f"{n_bad} face(s) not captured by a single extrude (chamfers / cross-holes / "
+                        "freeform) — best-effort, expect PARTIAL")
     bb = solid.bounding_box()
     base_z, top_z, thick = bb.min.Z, bb.max.Z, bb.size.Z
 
-    # 1. BASE: the largest Z-normal planar face at min z -> outline, extruded `thick` up.
-    planar = solid.faces().filter_by(GeomType.PLANE)
-    bottoms = [f for f in planar if abs(_normal(f).Z) > 0.99 and abs(f.center().Z - base_z) < EPS]
-    if not bottoms:
-        raise ValueError("no Z-normal planar face at the base — not a Z-prismatic part")
-    base_face = max(bottoms, key=lambda f: f.area)
-    outer = base_face.outer_wire()
+    # 1. OUTLINE + through-holes from a CROSS-SECTION, not a single end face — robust to stepped or
+    # fragmented ends (a plate whose bottom is broken into islands still yields one clean outline).
+    # Section a bit below mid so top-side blind features aren't mistaken for through-holes.
+    zc = base_z + 0.4 * thick
+    cutter = Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)
+    sec = solid.intersect(cutter).faces()
+    if len(sec) != 1:
+        raise ValueError(f"cross-section is {len(sec)} disjoint regions — not one extruded profile")
+    sec = sec[0]
+    outer = sec.outer_wire()
     outline = _classify_wire(outer, warnings)
     if outline is None:
-        raise ValueError("base outline not recognizable (lines + circular arcs only; has splines/ellipses)")
+        raise ValueError("outline not recognizable (lines + circular arcs only; has splines/ellipses)")
 
     feats = [_sketch_from_outline("outline", outline),
              IR.pad("body", "outline", length=round(thick, 4))]
 
-    # 2a. THROUGH holes = the base face's INNER wires — ANY shape (circle, slot, obround, polygon,
+    # 2a. THROUGH holes = the section's INNER wires — ANY shape (circle, slot, obround, polygon,
     # arcs), not just circular bores. Circles -> one drill sketch; each non-circular wire -> a poly
     # cut. `captured` collects every wire's circular-edge signature (outer + inner) so their cylinders
     # aren't re-detected as blind holes below.
@@ -285,7 +303,7 @@ def _recognize_extrude(orig, name):
         return (round(e.arc_center.X, 2), round(e.arc_center.Y, 2), round(e.radius, 2))
     captured = {_sig(e) for e in outer.edges().filter_by(GeomType.CIRCLE)}
     thru_circ, thru_poly = [], []
-    for w in base_face.inner_wires():
+    for w in sec.inner_wires():
         cl = _classify_wire(w, warnings)
         if cl is None:
             continue
