@@ -68,6 +68,23 @@ def polar_pocket(name, radius, length, mount_r, z=0.0, count=4, phase=0.0):
             "mount_r": mount_r, "z": z, "count": count, "phase": phase}
 
 
+def prism_cut(name, origin, normal, xdir, depth, polys=()):
+    """Subtract a 2D profile extruded along an arbitrary axis at an arbitrary location. The profile
+    (polys — [outer, hole, hole, ...], each a wire of (u, v[, bulge]) in the plane's own 2D frame)
+    lies in the plane through `origin` with local +X = `xdir` and outward normal `normal`; it is
+    extruded `depth` along +normal and cut from the running solid.
+
+    This is the general placed cut the STEP recognizer emits for RECOVERED features that plain
+    face-attached pocket() can't place: multi-level / through pockets along the main axis (normal ∥
+    the extrude axis) AND cross-axis holes (normal ⊥ it). One primitive, any axis, any location —
+    a profile swept along some direction, subtracted."""
+    return {"kind": "prism_cut", "name": name,
+            "origin": [round(float(c), 6) for c in origin],
+            "normal": [round(float(c), 6) for c in normal],
+            "xdir": [round(float(c), 6) for c in xdir], "depth": depth,
+            "polys": [[list(p) for p in poly] for poly in polys]}
+
+
 def part(name, *features):
     return {"name": name, "features": list(features)}
 

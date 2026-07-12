@@ -38,9 +38,13 @@ def _poly_face(poly, plane_obj):
         pts, bul = pts[:-1], bul[:-1]
     if all(abs(b) < 1e-9 for b in bul):
         return plane_obj * Polygon(*pts, align=None)     # straight polygon (fast path)
+    # Build the arc profile in LOCAL XY, then place it onto plane_obj with a left-multiply — same as
+    # the fast path. (Building directly on plane_obj drops the origin's IN-PLANE offset, which is
+    # invisible for Z-normal offset planes but wrong for a cross-axis plane whose origin has an
+    # in-plane Z component.)
     n = len(pts)
-    with BuildSketch(plane_obj) as sk:
-        with BuildLine(plane_obj):
+    with BuildSketch(Plane.XY) as sk:
+        with BuildLine(Plane.XY):
             for i in range(n):
                 p1, p2, b = pts[i], pts[(i + 1) % n], bul[i]
                 if abs(b) < 1e-9:
@@ -49,7 +53,7 @@ def _poly_face(poly, plane_obj):
                     chord = math.dist(p1, p2)
                     SagittaArc(p1, p2, b * chord / 2.0)
         make_face()
-    return sk.sketch
+    return plane_obj * sk.sketch
 
 
 def _polys_region(polys, plane_obj):
@@ -114,8 +118,9 @@ def emit(spec):
         if kind == "sketch":
             on = f.get("on")
             if on:
-                if f.get("rects") or f.get("polys"):
-                    raise ValueError("face-attached sketches support circles only (v0)")
+                # Attach the sketch to the part's top/bottom face: circles, rects, and polys
+                # (arbitrary outlines) all build at that face's z — this is what lets a blind
+                # pocket take a non-circular floor outline (the residual pocket-recovery path).
                 z0 = _face_z(part, on.get("side", "top"))
                 plane = "XY"
             else:
@@ -131,10 +136,16 @@ def emit(spec):
         elif kind == "pad":
             faces, z0 = sketches[f["sketch"]]
             length = f["length"]
+            # Deterministic direction: grow +Z for an XY / top-face sketch, -Z only for a bottom-face
+            # one. extrude(fc, amount) alone follows the region's winding-dependent normal, so the same
+            # IR could pad up in one backend and down in another (breaking cross-backend parity and any
+            # absolute-coord prism_cut placed against it). +Z matches the FreeCAD emitter.
+            d = -1.0 if (part is not None and z0 < -1e-6
+                         and abs(z0 - _face_z(part, "bottom")) < 1e-6) else 1.0
             solid = None
             for fc in faces:
                 s = (extrude(fc, amount=length / 2, both=True) if f.get("symmetric")
-                     else extrude(fc, amount=length))
+                     else extrude(fc, amount=length, dir=(0, 0, d)))
                 solid = s if solid is None else solid + s
             part = solid if part is None else part + solid
             params[f["name"]] = {"length": round(float(length), 4)}
@@ -187,6 +198,17 @@ def emit(spec):
                 cutter = cyl if cutter is None else cutter + cyl
             part = part - cutter
             params[f["name"]] = {"count": n, "radius": round(float(r), 4)}
+        elif kind == "prism_cut":
+            # a profile in the plane {origin, x_dir, normal}, extruded `depth` along +normal, cut.
+            # Extrude along the EXPLICIT normal (dir=), not the region face's own normal — the latter
+            # depends on poly winding and would cut the wrong way for a hole-in-region (e.g. a pocket
+            # ledge annulus), silently over-cutting.
+            nrm = tuple(f["normal"])
+            pl = Plane(origin=tuple(f["origin"]), x_dir=tuple(f["xdir"]), z_dir=nrm)
+            region = _polys_region(f["polys"], pl)
+            if region is not None:
+                part = part - extrude(region, amount=f["depth"], dir=nrm)
+            params[f["name"]] = {"depth": round(float(f["depth"]), 4)}
         else:
             raise ValueError(f"unknown feature kind: {kind}")
 

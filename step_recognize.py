@@ -9,16 +9,22 @@ is CROSS-SECTIONAL. recognize() tries both:
     recover the profile + through/blind holes. Orientation-agnostic (X/Y/Z or any face normal).
   * REVOLVE — find the axis the solid is unchanged under rotation about (a body of revolution),
     take the MERIDIAN (a half-plane section through the axis) as the profile, emit revolve(360).
-Profiles may have straight edges AND circular arcs (DXF bulge). It returns whichever the re-emit
-verifies.
+Profiles may have straight edges AND circular arcs (DXF bulge).
 
-The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit and
-its volume + (rotation-tolerant) bounding box are compared to the original STEP. So every result
-is either "verified" (provably the same solid, Δvol≈0) or "partial/unrecognized" with the residual
-reported — in which case the caller should fall back to importing the STEP as one solid. Out of
-scope (surfaced as residual, never silently wrong): fillets/chamfers, revolves / lofts / sweeps /
-freeform, additive bosses, and profiles whose boundary has ARCS (straight-edge polygons + circular
-holes only for now — arc-wire support is the next increment).
+MULTI-AXIS RECOVERY closes real machined parts that no single extrude/revolve can: when the base
+extrude doesn't verify, the residual (base − original) is carved feature by feature. Every leftover
+lump is itself a 2D profile extruded along ITS OWN axis — a floor / through-web pocket along the
+main axis, a cross-hole perpendicular to it — so each is recognized and subtracted as a `prism_cut`
+(a placed profile-along-an-axis), looping until the residual vanishes. On the NIST CTC-01 test part
+this takes a 139%-off base extrude to a verified reconstruction, leaving only the edge chamfers.
+
+The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit and its
+volume + (rotation-tolerant) bounding box are compared to the original STEP. Several axes can look
+prismatic, so recognize() gathers a candidate per axis and lets verification pick the winner — first
+a base that verifies on its own, else the first whose recovery verifies. Every result is either
+"verified" (provably the same solid within tolerance, Δvol≈0) or PARTIAL with the residual reported.
+Out of scope (surfaced as residual, never silently wrong): edge fillets/chamfers, additive bosses,
+lofts/sweeps/freeform, and profiles whose boundary has splines/ellipses (lines + circular arcs only).
 
     python step_recognize.py part.step                    # recognize + print the tree/verdict
     python step_recognize.py part.step --stl out.stl      # + write the recovered solid (mesh viewer)
@@ -41,6 +47,8 @@ EPS = 1e-3
 ANG = 1e-2           # direction tolerance: |dot|<ANG == perpendicular, >1-ANG == parallel
 VOL_TOL = 0.005      # 0.5% volume agreement -> "verified"
 DIM_TOL = 0.05       # mm bbox-size agreement
+RECOVER_PASSES = 4   # multi-axis residual-carve passes (each re-decomposes what's left)
+RECOVER_EPS = 5.0    # mm^3: ignore boolean slivers / zero-volume sheets in the residual
 
 
 # --- cross-sectional intelligence: is this solid a 2D profile extruded along SOME axis? ---------
@@ -79,10 +87,11 @@ def _extrude_nonconforming(solid, a):
     return bad
 
 
-def _find_extrude_axis(solid):
-    """The axis the solid is (most nearly) a prismatic extrusion along — the one with the FEWEST
-    non-conforming faces. Returns (axis, n_bad); n_bad == 0 is a clean extrude, a few means chamfers/
-    cross-holes (best-effort, PARTIAL). None if even the best axis is mostly non-conforming."""
+def _extrude_axes(solid):
+    """Candidate extrude axes RANKED by how prismatic the solid is along each (fewest non-conforming
+    faces first), keeping only axes that are mostly-prismatic (n_bad <= 40% of faces). A ranked list,
+    not just the winner, so the recognizer can fall through to the next axis when the best one yields
+    a fragmented cross-section (a cross-feature can make an orthogonal axis look deceptively clean)."""
     faces = solid.faces()
     cands = [Vector(0, 0, 1), Vector(0, 1, 0), Vector(1, 0, 0)]
     for f in faces.filter_by(GeomType.PLANE):
@@ -92,17 +101,21 @@ def _find_extrude_axis(solid):
             ax = _cyl_axis(f)
             if ax:
                 cands.append(ax)
-    best, best_bad, seen = None, None, []
+    scored, seen = [], []
     for a in cands:
         if a.length < EPS or any(abs(a.dot(u)) > 1 - ANG for u in seen):
             continue
         seen.append(a.normalized())
-        bad = _extrude_nonconforming(solid, a)
-        if best is None or bad < best_bad:
-            best, best_bad = a.normalized(), bad
-    if best is not None and best_bad <= 0.4 * len(faces):   # mostly a prism along `best`
-        return best, best_bad
-    return None, None
+        scored.append((a.normalized(), _extrude_nonconforming(solid, a)))
+    lim = 0.4 * len(faces)
+    return sorted([(a, b) for a, b in scored if b <= lim], key=lambda t: t[1])
+
+
+def _find_extrude_axis(solid):
+    """The single best-fit extrude axis (fewest non-conforming faces). Returns (axis, n_bad), or
+    (None, None) if even the best axis is mostly non-conforming."""
+    axes = _extrude_axes(solid)
+    return axes[0] if axes else (None, None)
 
 
 def _align_to_z(solid, a):
@@ -114,6 +127,149 @@ def _align_to_z(solid, a):
     axis_dir = a.cross(z)
     angle = math.degrees(math.acos(max(-1.0, min(1.0, a.dot(z)))))
     return solid.rotate(Axis((0, 0, 0), axis_dir.to_tuple()), angle)
+
+
+def _canon_axis(a):
+    """Flip an axis so its dominant component is positive — a stable canonical direction (a prism is
+    the same whether swept +axis or -axis), which keeps prism_cut off the -Z degenerate."""
+    t = a.to_tuple()
+    i = max(range(3), key=lambda k: abs(t[k]))
+    return a if t[i] >= 0 else Vector(-a.X, -a.Y, -a.Z)
+
+
+def _unalign_vec(v, a):
+    """Inverse of _align_to_z, on a direction vector: map the Z-frame vector `v` back into axis a's
+    frame (Rodrigues rotation by -angle about a×z). So a profile recovered in the aligned Z-frame can
+    be placed back at a's true orientation for a prism_cut."""
+    a = a.normalized()
+    z = Vector(0, 0, 1)
+    d = max(-1.0, min(1.0, a.dot(z)))
+    if d > 1 - ANG:
+        return v
+    if d < -1 + ANG:
+        return Vector(v.X, -v.Y, -v.Z)            # a == -Z: 180deg about X
+    k = a.cross(z).normalized()
+    theta = -math.acos(d)
+    ct, st = math.cos(theta), math.sin(theta)
+    kv, kd = k.cross(v), k.dot(v)
+    return Vector(v.X * ct + kv.X * st + k.X * kd * (1 - ct),
+                  v.Y * ct + kv.Y * st + k.Y * kd * (1 - ct),
+                  v.Z * ct + kv.Z * st + k.Z * kd * (1 - ct))
+
+
+def _face_polys(face):
+    """A planar face -> [outer, hole, hole, ...] wires as (u, v[, bulge]) rings (a circle becomes a
+    2-arc ring), preserving islands. None if any wire is a spline/ellipse (recover honestly, no fake)."""
+    polys = []
+    for w in [face.outer_wire()] + list(face.inner_wires()):
+        cl = _classify_wire(w, [])
+        if cl is None:
+            return None
+        if cl[0] == "circle":
+            _, cx, cy, r = cl
+            polys.append([[cx - r, cy, 1.0], [cx + r, cy, 1.0]])   # full circle = two 180deg arcs
+        else:
+            polys.append(cl[1])
+    return polys
+
+
+def _component_prism(comp, name):
+    """A residual component -> a prism_cut IR feature: its recognized 2D profile extruded along its
+    OWN dominant axis over its own extent, placed at its true location. None if it isn't a single
+    clean profile this pass (multi-region -> a later pass re-decomposes it; sliver -> left honest)."""
+    try:
+        a, _ = _find_extrude_axis(comp)
+        if a is None:
+            return None
+        a = _canon_axis(a.normalized())
+        al = _align_to_z(comp, a)
+        lb = al.bounding_box()
+        cx, cy = 0.5 * (lb.min.X + lb.max.X), 0.5 * (lb.min.Y + lb.max.Y)   # lumps are off-center
+        zc = lb.min.Z + 0.5 * lb.size.Z
+        sec = al.intersect(Pos(cx, cy, zc) * Rectangle(lb.size.X + 50, lb.size.Y + 50)).faces()
+        if len(sec) != 1:
+            return None
+        polys = _face_polys(sec[0])
+        if polys is None:
+            return None
+        b3d_emit._polys_region(polys, Plane.XY)     # validate: raises on a degenerate profile
+        origin = _unalign_vec(Vector(0, 0, lb.min.Z), a)
+        xdir = _unalign_vec(Vector(1, 0, 0), a)
+        return IR.prism_cut(name, origin=origin.to_tuple(), normal=a.to_tuple(),
+                            xdir=xdir.to_tuple(), depth=round(lb.size.Z, 4), polys=polys)
+    except Exception:
+        return None
+
+
+def _is_hole_prism(feat):
+    p = feat.get("polys", [])
+    return len(p) == 1 and len(p[0]) == 2 and all(len(v) > 2 and abs(abs(v[2]) - 1) < 0.1 for v in p[0])
+
+
+def _recover_multiaxis(spec, orig, axis, name):
+    """Close the residual of a best-effort extrude (outline + through-holes that didn't verify) by
+    recovering the machined interior as prism_cuts: (A) floor pockets — every significant intermediate
+    perpendicular-to-axis planar face is a pocket floor; (B) a residual-carve loop — whatever's left
+    (multi-level / through-web pockets, cross-axis holes) is a set of separate lumps, each a clean 2D
+    profile extruded along its OWN axis. All prism_cuts, so the whole thing self-verifies via re-emit.
+    Returns (recovered_spec, counts)."""
+    feats = list(spec["features"])
+    counts = {"pockets": 0, "holes": 0, "residual_lumps": 0}
+
+    # Work in the EMITTED base's own frame: emit the base, then translate the axis-aligned original so
+    # its bounding box coincides with it. (The base pad's direction isn't fixed — the outline winding
+    # can send it +Z or -Z — so we can't assume z in [0, thick]; matching bboxes makes recovery
+    # frame-agnostic, and the two share the same outer envelope so min-corner alignment is exact.)
+    part, _ = b3d_emit.emit(IR.part(name, *feats))
+    pbb = part.bounding_box()
+    aligned = _align_to_z(orig, axis)
+    abb = aligned.bounding_box()
+    aligned0 = aligned.translate((pbb.min.X - abb.min.X, pbb.min.Y - abb.min.Y, pbb.min.Z - abb.min.Z))
+    base_z0, top_z0 = pbb.min.Z, pbb.max.Z
+
+    # (A) floor pockets — every significant intermediate perpendicular-to-axis planar face is a floor.
+    foot = pbb.size.X * pbb.size.Y
+    for f in aligned0.faces().filter_by(GeomType.PLANE):
+        nrm = _normal(f).normalized()
+        if abs(abs(nrm.Z) - 1) > ANG:
+            continue
+        zc = f.position_at(0.5, 0.5).Z
+        if not (base_z0 + EPS < zc < top_z0 - EPS) or f.area <= 0.01 * foot:
+            continue
+        polys = _face_polys(f)
+        if polys is None:
+            continue
+        origin_z, depth = (zc, top_z0 - zc) if nrm.Z > 0 else (base_z0, zc - base_z0)
+        feats.append(IR.prism_cut(f"pocket{counts['pockets']}", origin=(0, 0, origin_z),
+                                  normal=(0, 0, 1), xdir=(1, 0, 0), depth=round(depth, 4), polys=polys))
+        counts["pockets"] += 1
+
+    # (B) residual carve
+    if counts["pockets"]:
+        part, _ = b3d_emit.emit(IR.part(name, *feats))
+    for _p in range(RECOVER_PASSES):
+        comps = [c for c in (part - aligned0).solids() if c.volume > RECOVER_EPS]
+        if not comps:
+            break
+        added = []
+        for c in comps:
+            pf = _component_prism(c, f"cut{counts['pockets'] + counts['holes'] + len(added)}")
+            if pf is not None:
+                added.append(pf)
+        if not added:
+            break
+        trial = feats + added
+        try:
+            part2, _ = b3d_emit.emit(IR.part(name, *trial))
+        except Exception:
+            break                                        # a cut didn't build -> keep what we have
+        if part2.volume >= part.volume - RECOVER_EPS:
+            break                                        # no progress -> stop (rest is chamfers)
+        for pf in added:
+            counts["holes" if _is_hole_prism(pf) else "pockets"] += 1
+        feats, part = trial, part2
+    counts["residual_lumps"] = len([c for c in (part - aligned0).solids() if c.volume > RECOVER_EPS])
+    return IR.part(name, *feats), counts
 
 
 # --- revolve intelligence: is this solid a body of revolution about SOME axis? -----------------
@@ -235,43 +391,102 @@ def _close(a, b):
     return abs(a[0] - b[0]) < EPS and abs(a[1] - b[1]) < EPS
 
 
-def recognize(step_path, name=None, verify=True):
-    """STEP file -> (IR spec, report). Tries EXTRUDE then REVOLVE, returning whichever the re-emit
-    VERIFIES (Δvol≈0); if neither verifies, the closer residual. report.verified says which."""
+def _wire_xy(wire):
+    """A wire's (x, y) bounding-box center, rounded — a stable key for matching the same vertical
+    hole across cross-sections at different heights."""
+    wb = wire.bounding_box()
+    return (round((wb.min.X + wb.max.X) / 2, 1), round((wb.min.Y + wb.max.Y) / 2, 1))
+
+
+def _through_centroids(solid, base_z, top_z, bb):
+    """(x, y) keys of inner-wire holes that appear near BOTH end faces — i.e. bores that actually go
+    all the way through. A blind pocket appears near only one face, so it's excluded (and recovered as
+    a pocket instead of being over-cut as a through-hole)."""
+    def inner_keys(z):
+        cut = Plane.XY.offset(z) * Rectangle(bb.size.X + 50, bb.size.Y + 50)
+        keys = set()
+        for ff in solid.intersect(cut).faces():
+            for w in ff.inner_wires():
+                keys.add(_wire_xy(w))
+        return keys
+    d = min(1.0, 0.02 * (top_z - base_z))
+    return inner_keys(base_z + d) & inner_keys(top_z - d)
+
+
+def _report_for(spec, extras, name):
+    ax = extras.get("axis")
+    return {"name": name, "features": len(spec["features"]), "method": extras.get("method"),
+            "through_holes": extras.get("through_holes", 0),
+            "blind_holes": extras.get("blind_holes", 0), "warnings": list(extras.get("warnings", [])),
+            "extrude_axis": tuple(round(c, 3) for c in ax.to_tuple()) if ax is not None else None,
+            "verified": None}
+
+
+def recognize(step_path, name=None, verify=True, recover=True):
+    """STEP file -> (IR spec, report). Recovers a feature tree by EXTRUDE (a 2D profile swept along an
+    axis + holes) or REVOLVE. Several axes may look prismatic, so it gathers a candidate per axis and
+    lets SELF-VERIFICATION pick the winner: first a candidate whose base re-emit VERIFIES on its own
+    (Δvol≈0); else — with recover=True — multi-axis recovery (floor / through pockets + cross-axis
+    holes as prism_cuts) is run per axis and the first that verifies wins (report.recovered has the
+    tally). If nothing verifies, the closest residual is returned (report.verified is False)."""
     orig = import_step(str(step_path))
     orig = orig.solid() if hasattr(orig, "solid") else orig
     name = name or Path(step_path).stem
-    candidates = []
-    for fn in (_recognize_extrude, _recognize_revolve):
+
+    # candidate decompositions: one extrude per prismatic axis (rank order) + a revolve if applicable.
+    cands = []
+    for axis, n_bad in _extrude_axes(orig):
         try:
-            spec, extras = fn(orig, name)
-        except Exception:
+            cands.append(_extrude_along(orig, name, axis, n_bad))
+        except ValueError:
             continue
-        ax = extras.get("axis")
-        report = {"name": name, "features": len(spec["features"]), "method": extras.get("method"),
-                  "through_holes": extras.get("through_holes", 0),
-                  "blind_holes": extras.get("blind_holes", 0), "warnings": extras.get("warnings", []),
-                  "extrude_axis": tuple(round(c, 3) for c in ax.to_tuple()) if ax is not None else None,
-                  "verified": None}
-        if verify:
-            report.update(_verify(spec, orig))
-        if not verify or report.get("verified"):
+    try:
+        cands.append(_recognize_revolve(orig, name))
+    except Exception:
+        pass
+    if not cands:
+        raise ValueError("neither a recognizable extrude nor a body of revolution")
+    if not verify:
+        spec, extras = cands[0]
+        return spec, _report_for(spec, extras, name)
+
+    # Pass 1: prefer a candidate whose BASE verifies with NO recovery — the simplest clean extrude /
+    # revolve (this is what keeps an L extruded along Y from being "recovered" as a box + a carve).
+    reports = []
+    for spec, extras in cands:
+        report = _report_for(spec, extras, name)
+        report.update(_verify(spec, orig))
+        if report["verified"]:
             return spec, report
-        candidates.append((spec, report))
-    if candidates:
-        return min(candidates, key=lambda c: c[1].get("dvol_pct", 1e9))
-    raise ValueError("neither a recognizable extrude nor a body of revolution")
+        reports.append((spec, extras, report))
+
+    # Pass 2: multi-axis recovery per extrude candidate (rank order); first that verifies wins.
+    best = min(reports, key=lambda c: c[2].get("dvol_pct", 1e9))
+    if recover:
+        for spec, extras, report in reports:
+            if extras.get("method") != "extrude" or extras.get("axis") is None:
+                continue
+            try:
+                rspec, counts = _recover_multiaxis(spec, orig, extras["axis"], name)
+            except Exception:
+                continue
+            rreport = _report_for(rspec, extras, name)
+            rreport.update(_verify(rspec, orig))
+            rreport["recovered"] = counts
+            rreport["warnings"].append(
+                f"multi-axis recovery: +{counts['pockets']} pocket(s), +{counts['holes']} "
+                f"cross-hole(s); {counts['residual_lumps']} residual lump(s) (chamfers/fillets) left uncut")
+            if rreport["verified"]:
+                return rspec, rreport
+            if rreport.get("dvol_pct", 1e9) < best[2].get("dvol_pct", 1e9):
+                best = (rspec, extras, rreport)
+    return best[0], best[2]
 
 
-def _recognize_extrude(orig, name):
-    """Recognize a 2D profile extruded along some axis (+ through/blind holes). Returns
-    (spec, extras) or raises if it isn't a prismatic extrusion."""
+def _extrude_along(orig, name, axis, n_bad):
+    """Recognize `orig` as a 2D profile extruded along the given `axis` (+ through/blind holes).
+    Raises ValueError if the cross-section along this axis isn't a single recognizable profile."""
     warnings = []
-    # cross-section intelligence: find the axis this solid is a prismatic extrusion along (any
-    # orientation) and rotate it onto Z, so the Z-profile+holes logic below is axis-agnostic.
-    axis, n_bad = _find_extrude_axis(orig)
-    if axis is None:
-        raise ValueError("not a prismatic extrusion (mostly angled/curved/cross-axis faces)")
     solid = _align_to_z(orig, axis)
     if abs(axis.dot(Vector(0, 0, 1))) < 1 - ANG:
         warnings.append(f"extrude axis {tuple(round(c, 3) for c in axis.to_tuple())} -> rotated onto Z")
@@ -283,13 +498,17 @@ def _recognize_extrude(orig, name):
 
     # 1. OUTLINE + through-holes from a CROSS-SECTION, not a single end face — robust to stepped or
     # fragmented ends (a plate whose bottom is broken into islands still yields one clean outline).
-    # Section a bit below mid so top-side blind features aren't mistaken for through-holes.
-    zc = base_z + 0.4 * thick
-    cutter = Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)
-    sec = solid.intersect(cutter).faces()
-    if len(sec) != 1:
-        raise ValueError(f"cross-section is {len(sec)} disjoint regions — not one extruded profile")
-    sec = sec[0]
+    # Sample a few heights (not just one fraction) so the section doesn't land exactly on a feature
+    # plane (a pocket floor) and fragment; take the first height giving one clean region.
+    sec = None
+    for frac in (0.4, 0.27, 0.6, 0.5, 0.72, 0.33):
+        zc = base_z + frac * thick
+        faces = solid.intersect(Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)).faces()
+        if len(faces) == 1:
+            sec = faces[0]
+            break
+    if sec is None:
+        raise ValueError("cross-section is disjoint at every sampled height — not one extruded profile")
     outer = sec.outer_wire()
     outline = _classify_wire(outer, warnings)
     if outline is None:
@@ -298,18 +517,21 @@ def _recognize_extrude(orig, name):
     feats = [_sketch_from_outline("outline", outline),
              IR.pad("body", "outline", length=round(thick, 4))]
 
-    # 2a. THROUGH holes = the section's INNER wires — ANY shape (circle, slot, obround, polygon,
-    # arcs), not just circular bores. Circles -> one drill sketch; each non-circular wire -> a poly
-    # cut. `captured` collects every wire's circular-edge signature (outer + inner) so their cylinders
-    # aren't re-detected as blind holes below.
+    # 2a. THROUGH holes = the section's INNER wires that are ACTUALLY through — present near BOTH end
+    # faces (a blind pocket whose floor is below the section shows up here too, but only near one face;
+    # emitting it as through would over-cut, and an over-cut can't be recovered, so we leave it for the
+    # pocket-recovery pass). Any shape (circle, slot, obround, polygon, arcs) — circles become one drill
+    # sketch, each non-circular wire a poly cut. `captured` collects the through wires' circular-edge
+    # signatures (+ the outline's) so their cylinders aren't re-detected as blind holes below.
     def _sig(e):
         return (round(e.arc_center.X, 2), round(e.arc_center.Y, 2), round(e.radius, 2))
+    thru_at = _through_centroids(solid, base_z, top_z, bb)
     captured = {_sig(e) for e in outer.edges().filter_by(GeomType.CIRCLE)}
     thru_circ, thru_poly = [], []
     for w in sec.inner_wires():
         cl = _classify_wire(w, warnings)
-        if cl is None:
-            continue
+        if cl is None or _wire_xy(w) not in thru_at:
+            continue                          # blind / stepped -> recovery handles it (don't over-cut)
         captured.update(_sig(e) for e in w.edges().filter_by(GeomType.CIRCLE))
         (thru_circ if cl[0] == "circle" else thru_poly).append(
             (cl[1], cl[2], cl[3]) if cl[0] == "circle" else cl[1])

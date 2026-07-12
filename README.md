@@ -79,12 +79,19 @@ json.dump(spec, open("bracket.ir.json", "w"))            # then: python3 gen.py 
 
 ## The IR (see [`ir.py`](ir.py))
 
-- `sketch(name, plane="XY", circles=[(cx,cy,r)], rects=[(w,h,cx,cy)], polys=[wire,...], on=None)`
+- `sketch(name, plane="XY"|"XZ", circles=[(cx,cy,r)], rects=[(w,h,cx,cy)], polys=[wire,...], on=None)`
   — `polys`: first wire = outer profile, following wires = holes (one sketch → one pad gives a plate
-  with holes). `on={"face_of": feat, "side": "top"|"bottom"}` attaches the sketch to a face chosen by
-  **query** (circles only, v0).
-- `pad(name, sketch, length, symmetric=False)`
+  with holes); a wire vertex may carry a DXF **bulge** `(x,y,bulge)` for a circular arc.
+  `on={"face_of": feat, "side": "top"|"bottom"}` attaches the sketch to a face chosen by **query**
+  (circles, rects, *and* polys).
+- `pad(name, sketch, length, symmetric=False)` — deterministic +Z growth (so both backends agree).
 - `pocket(name, sketch, through=True, length=None)`
+- `revolve(name, sketch, angle=360)` — revolve an XZ profile about Z (wheels, bosses, nozzles).
+- `prism_cut(name, origin, normal, xdir, depth, polys=[wire,...])` — subtract a 2D profile extruded
+  along an **arbitrary axis** at an **arbitrary location**. One primitive for any placed cut: a
+  floor / through pocket along the main axis *or* a cross-axis hole ⊥ to it. This is what multi-axis
+  STEP recovery emits; both backends build it identically.
+- `polar_pocket(name, radius, length, mount_r, z, count, phase)` — a ring of tangent bores.
 - `fillet(name, radius, select={"circles": "top_outer"})` — edges chosen by **query**, re-resolved to
   live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
 - `part(name, *features)` → the spec. `update_from_freecad(spec, params)` flows read-back edits in.
@@ -107,26 +114,30 @@ print(res["volume"], "mm^3")                        # 11497.3, same as FreeCAD
 python3 b3d_emit.py --sample plate out/plate.stl    # IR -> watertight .stl
 ```
 
-Coverage mirrors `fc_build.py`: sketches (circles / rects / polygons-with-holes) on XY or a part's
-top/bottom face, pad (± midplane), pocket (through / blind), and fillet by the **same edge query**
-the IR stores (resolved against live geometry, no kernel ids).
+Coverage mirrors `fc_build.py`: sketches (circles / rects / polygons-with-holes, straight + arc) on
+XY / XZ or a part's top/bottom face, pad (± midplane), pocket (through / blind), revolve, `prism_cut`
+(placed profile-along-any-axis), polar pockets, and fillet by the **same edge query** the IR stores
+(resolved against live geometry, no kernel ids).
 
-## STEP → IR (feature recognition)
+## STEP → IR (feature recognition) — round-trip engineering
 
-A STEP file is a dumb B-rep — no feature tree — so you can't *convert* it to an IR, only *infer*
-one. `step_recognize.py` does that for the **2.5D-prismatic class** the IR was built for: it
-classifies the solid's faces with the OpenCASCADE kernel (largest planar base face → outline + pad;
-concave cylindrical faces with a Z axis → circular through/blind pockets) and emits the IR.
+A STEP/STL from a vendor, a 3D scan, a colleague, or a decade-old archive is a **frozen solid**: the
+parametric feature tree is gone, so it imports as one lump you can't edit by *operation*. Change a
+pocket's depth or a hole's diameter and you're pushing vertices, not editing the design's intent.
 
-The result is **self-verified**: the recognized IR is re-emitted through `b3d_emit` and its volume +
-bounding box are compared to the original STEP. So every recognition is either **VERIFIED** (Δvol ≈ 0
-— provably the same solid, now an editable tree) or flagged **PARTIAL** with the residual, in which
-case you fall back to importing the STEP as one solid. It never fakes a tree.
+`step_recognize.py` **recovers a feature tree from the dumb B-rep** — and, paired with the by-name
+round-trip below, that closes the engineering loop: **import a frozen solid → recover a named,
+parametric tree → edit an operation in FreeCAD (or build123d) → re-emit → and it's *proven* to still
+be the same part minus your intended change.** The neutral file becomes editable again, without
+trusting a black-box recognizer that might quietly be wrong — because every recovery is checked by
+reconstruction (below). That is the motivation for the whole tool: neutral files are how CAD data
+actually moves between people and programs; this makes them *parametric* again on the way in.
 
 ```python
 import step_recognize
-spec, report = step_recognize.recognize("plate.step")   # spec is a featuretree IR
-print(report["verified"], report["dvol_pct"])           # True 0.0
+spec, report = step_recognize.recognize("part.step")    # spec is a featuretree IR
+print(report["verified"], report["dvol_pct"], report.get("recovered"))
+# True 0.1 {'pockets': 11, 'holes': 10, 'residual_lumps': 2}   # NIST CTC-01
 ```
 
 ```bash
@@ -137,11 +148,65 @@ python3 step_recognize.py --selftest                        # generate fixtures,
 python3 -m pytest tests/                                     # full test suite (emit + recognize)
 ```
 
-Handled: extrudes and revolves in **any orientation**, profiles with **straight edges + arcs**,
-and through-holes of **any shape** (circle, slot/obround, polygon). **Out of scope** (surfaced as
-PARTIAL, never silently wrong): fillets/chamfers, additive bosses, non-circular *blind* pockets,
-and lofts / sweeps / freeform — there is no faithful feature tree to recover there (recognition is
-inference, non-unique in general), so the verifier rejects them rather than guess.
+### Recovery strategies
+
+The core idea: **most machined/printed parts are a 2D profile swept along an axis** — extruded, or
+revolved — **plus holes and pockets.** So recognition is *cross-sectional*, in layers, each proven
+before the next is trusted:
+
+1. **Dispatch — extrude vs revolve.** Find the axis the solid is a prismatic extrusion along (every
+   face planar-⊥, planar-∥, or a cylinder ∥ to it) or a body of revolution about (rotating it leaves
+   it unchanged). Orientation-agnostic: any X/Y/Z or face-normal axis is rotated onto Z.
+2. **Section-based outline.** The outline + through-holes come from a *cross-section*, sampled at a
+   few heights (not a single end face) so a stepped/fragmented end — or a section landing exactly on
+   a feature plane — doesn't derail it. The profile keeps **straight edges *and* circular arcs**.
+3. **Through vs blind.** An inner wire is emitted as a through-hole only if it's present near **both**
+   faces; a blind pocket (floor below the section) is *not* drilled through — over-cutting can't be
+   undone — but deferred to recovery. Through-holes may be **any shape** (circle, slot/obround, poly).
+4. **Multi-axis recovery.** When the base extrude doesn't verify, the machined interior is still in
+   the **residual** (`recovered − original`), which is carved feature by feature:
+   - **(A) floor pockets** — every significant intermediate plane ⊥ the axis is a pocket *floor*;
+     cut it (keeping islands/bosses standing via outer-minus-inner-wire profiles);
+   - **(B) residual carve loop** — whatever's left breaks into separate lumps, and *each lump is
+     itself a 2D profile extruded along **its own** axis* — a through-web pocket ∥ the main axis, a
+     **cross-axis hole** ⊥ it. Recognize each and subtract it as a `prism_cut` (a placed
+     profile-along-an-axis), looping until the residual vanishes.
+5. **Verification-driven axis choice.** Several axes can *look* prismatic (a cross-hole makes its own
+   axis look clean), so recognize() gathers a candidate per axis and lets **verification** pick the
+   winner: first a base that verifies on its own (the simplest clean extrude), else the first whose
+   recovery verifies.
+6. **Self-verification (the honesty).** The recovered IR is re-emitted through `b3d_emit` and its
+   volume + (rotation-tolerant) bounding box compared to the original. Every result is **VERIFIED**
+   (Δvol ≈ 0 — provably the same solid within tolerance, now an editable tree) or **PARTIAL** with
+   the residual reported. This is what tames the non-uniqueness of feature recognition: *any*
+   decomposition that reconstructs the solid is accepted — geometric equivalence, not a guess at the
+   designer's exact operations — and anything that doesn't reconstruct is rejected, never faked.
+
+On the NIST CTC-01 test part (multi-level pockets, through-web windows, 12 cross-holes, 8 chamfers)
+this takes a 139%-off base extrude to a **verified** 51-feature tree, and that tree re-emits to the
+**identical volume in both build123d *and* FreeCAD** — the recovered part is genuinely editable in
+either.
+
+### Drawbacks & limits (surfaced, never silently wrong)
+
+- **Equivalence, not intent.** Verification certifies the recovered solid *matches* within tolerance
+  — not that the operations are the ones the designer used. A two-level pocket may come back as
+  several `prism_cut`s rather than "ledge + bore"; it's the same geometry, editable, but not
+  necessarily the same *history*. Recognition is inference and non-unique in general.
+- **Edge fillets/chamfers aren't in the vocabulary** — they're edge blends, not swept profiles — so
+  they're left as **sub-tolerance residual**. A chamfered part can verify within tolerance while the
+  recovered tree has sharp edges (`recovered.residual_lumps` and a warning disclose it). NIST's 8
+  chamfers are its whole ~0.1% residual.
+- **Additive bosses can't be recovered** (recovery only *subtracts* from the outline envelope). A
+  raised post on a base is flagged PARTIAL, not faked.
+- **Splines / ellipses / lofts / sweeps / freeform → PARTIAL.** No faithful sketch-and-pad tree
+  exists; the verifier rejects rather than guess.
+- **Pathological tangencies can over-cut.** A cross-hole exactly coincident with a pocket floor
+  fragments that floor and the recovery may not close fully — but the verifier catches it and reports
+  PARTIAL rather than shipping a wrong tree. It degrades to honest, not to silently-incorrect.
+- **Cost.** Recovery runs repeated boolean diffs and per-axis attempts — **seconds** per complex
+  part, not milliseconds. It only kicks in when the base doesn't verify (clean prismatic parts are
+  fast). Disable with `recognize(..., recover=False)` for the base-only best-effort.
 
 ### Bridging IN from build123d (the reverse direction)
 
@@ -219,14 +284,19 @@ run `gen.py` / `roundtrip.py` directly), and make sure the FreeCAD AppImage is l
 
 ## Scope / honesty
 
-- **Working:** XY sketches (rect / circle / polygon + profile-with-holes), face-attached circle
-  sketches, Pad, Pocket (through / blind), query fillets; parameter round-trip (lengths, radii) by
-  name.
-- **Onshape backend (new):** sketches (polys / circles / rects) → Pad / Pocket via `onpy`; geometry
-  exact. Sketches arrive under-defined; fillets / face-attach / non-Top planes not yet. See
-  [Onshape backend](#onshape-backend).
-- **Deferred:** non-XY unattached planes, polygon / rect face-attached sketches, richer edge selectors
-  (by-radius / position / count), other backends (Fusion API / SolidWorks macro).
+- **Working:** XY / XZ sketches (rect / circle / polygon + profile-with-holes), face-attached sketches
+  (circle / rect / poly), Pad, Pocket (through / blind), Revolve, `prism_cut` (a profile extruded
+  along an arbitrary axis at an arbitrary location — the primitive multi-axis recovery emits), query
+  fillets, polar pocket patterns; parameter round-trip (lengths, radii) by name. FreeCAD *and*
+  build123d emit the same geometry from the same IR (verified equal on the recovered NIST tree).
+- **STEP → IR recognition:** extrude / revolve in any orientation, arcs, any-shape through-holes, and
+  **multi-axis recovery** (floor / through-web pockets + cross-axis holes) — self-verified by re-emit.
+  See [STEP → IR](#step--ir-feature-recognition--round-trip-engineering).
+- **Onshape backend:** sketches (polys / circles / rects) → Pad / Pocket via `onpy`; geometry
+  exact. Sketches arrive under-defined; fillets / face-attach / non-Top planes / `prism_cut` not yet.
+  See [Onshape backend](#onshape-backend).
+- **Deferred:** non-XY/XZ unattached planes, richer edge selectors (by-radius / position / count),
+  edge fillet/chamfer *recognition*, other backends (Fusion API / SolidWorks macro).
 - A SolidWorks `.SLDPRT` can't be written on Linux — that backend would emit a macro.
 
 ## License

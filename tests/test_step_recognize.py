@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from build123d import (Axis, Box, BuildPart, BuildSketch, Circle, Ellipse, Location, Locations,
-                       Mode, Plane, SlotOverall, extrude, fillet)
+                       Mode, Plane, Rectangle, SlotOverall, extrude, fillet)
 
 import ir as IR
 import step_recognize as sr
@@ -151,18 +151,74 @@ def test_verify_false_when_disabled_reports_none(tmp_path):
     assert r["verified"] is None and r["method"] == "extrude"
 
 
-def test_nist_ctc01_best_effort_partial():
-    """A real NIST test part (chamfers + cross-holes + multi-level pockets) is beyond a single
-    extrude/revolve. It's recovered best-effort along the dominant axis (outline + vertical holes)
-    but honestly flagged PARTIAL — never faked as verified."""
+def test_nist_ctc01_multiaxis_recovery():
+    """A real NIST test part (multi-level pockets + through-web windows + cross-axis holes + chamfers)
+    is far beyond a single extrude/revolve. Multi-axis recovery closes it: the base extrude leaves the
+    machined interior in the residual, then floor/through pockets and cross-holes are recovered as
+    prism_cuts until it re-emit-verifies to within tolerance. The chamfers (sub-tolerance) are left
+    honestly flagged as residual, not faked."""
     path = Path(__file__).parent / "step" / "nist_ctc_01_asme1_rd.stp"
     if not path.exists():
         pytest.skip("NIST fixture not present")
     spec, rep = sr.recognize(str(path))
-    assert rep["verified"] is False                      # too complex -> honestly not verified
     assert rep["method"] == "extrude" and rep["extrude_axis"] is not None
-    assert rep["through_holes"] >= 10                    # still recovers the vertical through-holes
-    assert any("not captured" in w for w in rep["warnings"])   # flags the chamfers / cross-holes
+    assert rep["verified"] is True                        # recovery closes it to within tolerance
+    assert rep["dvol_pct"] < 0.5                          # only the chamfers remain (~0.1%)
+    rec = rep["recovered"]
+    assert rec["pockets"] >= 6 and rec["holes"] >= 6      # multi-level pockets + cross/vertical holes
+    assert any("recovery" in w for w in rep["warnings"])  # discloses what was recovered / left
+
+
+def test_nist_ctc01_without_recovery_is_partial():
+    """With recovery disabled, the SAME part is honestly PARTIAL — a best-effort extrude along the
+    dominant axis that flags the faces a single extrude can't capture, never faking them verified."""
+    path = Path(__file__).parent / "step" / "nist_ctc_01_asme1_rd.stp"
+    if not path.exists():
+        pytest.skip("NIST fixture not present")
+    spec, rep = sr.recognize(str(path), recover=False)
+    assert rep["verified"] is False
+    assert rep["method"] == "extrude" and rep["extrude_axis"] is not None
+    assert any("not captured" in w for w in rep["warnings"])
+
+
+def test_multilevel_pocket_and_cross_hole(tmp_path):
+    """A block with a two-level (stepped) pocket AND a cross-axis hole — neither a single extrude nor
+    a revolve — is fully recovered by the multi-axis pass and re-emit-verifies to Δ~0."""
+    with BuildPart() as p:
+        Box(60, 40, 30)                                   # z in [-15, 15]
+        with BuildSketch(Plane.XY):
+            with Locations((-24, 0), (24, 0)):
+                Circle(3)
+        extrude(amount=30, both=True, mode=Mode.SUBTRACT)  # two vertical through-holes
+        with BuildSketch(Plane.XY.offset(15)):
+            Rectangle(30, 24)
+        extrude(amount=-8, mode=Mode.SUBTRACT)             # shallow ledge, floor z=7
+        with BuildSketch(Plane.XY.offset(15)):
+            Rectangle(18, 12)
+        extrude(amount=-20, mode=Mode.SUBTRACT)            # deeper floor z=-5
+        with BuildSketch(Plane.XZ):
+            with Locations((0, -10)):
+                Circle(3)
+        extrude(amount=40, both=True, mode=Mode.SUBTRACT)  # cross-hole along Y, below the pocket
+    _, r = sr.recognize(part_step(p.part, tmp_path))
+    assert r["verified"] is True and r["method"] == "extrude"
+    assert r["recovered"]["pockets"] >= 2                  # the two pocket levels
+    assert r["recovered"]["holes"] >= 1                    # the cross-axis hole
+
+
+def test_blind_pocket_not_over_drilled(tmp_path):
+    """A blind pocket whose floor sits below the mid cross-section must NOT be mistaken for a through
+    hole (which would over-cut, unrecoverably). The two-section test defers it to pocket recovery, and
+    the part still verifies with a solid floor under the pocket."""
+    with BuildPart() as p:
+        Box(40, 40, 20)
+        with BuildSketch(Plane.XY.offset(10)):
+            Rectangle(20, 20)
+        extrude(amount=-12, mode=Mode.SUBTRACT)            # blind pocket, floor at z=-2 (not through)
+    _, r = sr.recognize(part_step(p.part, tmp_path))
+    assert r["verified"] is True
+    assert r["through_holes"] == 0                         # never drilled through
+    assert r["recovered"]["pockets"] >= 1
 
 
 def test_cli_stl_output(tmp_path):

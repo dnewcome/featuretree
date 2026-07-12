@@ -50,6 +50,16 @@ def _add_poly(sk, pts):
             sk.addGeometry(Part.Arc(p1, mid, p2), False)
 
 
+def _map_poly(poly, inv, zref):
+    """Map a poly's (x, y[, bulge]) vertices from global coords into a sketch's local frame via the
+    placement inverse `inv` (bulge is orientation-free, carried through)."""
+    out = []
+    for p in poly:
+        lp = inv.multVec(App.Vector(float(p[0]), float(p[1]), zref))
+        out.append([lp.x, lp.y] + ([float(p[2])] if len(p) > 2 else []))
+    return out
+
+
 def build(spec, out_path):
     doc = App.newDocument(spec["name"])
     body = doc.addObject("PartDesign::Body", "Body")
@@ -63,18 +73,21 @@ def build(spec, out_path):
             sk.Label = f["name"]
             on = f.get("on")
             if on:                                  # attach to a face chosen by query
-                if f.get("rects") or f.get("polys"):
-                    raise ValueError("face-attached sketches support circles only (v0)")
                 face = fc_common.resolve_face(tip.Shape, on.get("side", "top"))
                 sk.AttachmentSupport = [(tip, [face])]
                 sk.MapMode = "FlatFace"
                 doc.recompute()                     # so sk.Placement is resolved
                 zref = max(v.Z for v in tip.Shape.Vertexes) if on.get("side", "top") == "top" \
                     else min(v.Z for v in tip.Shape.Vertexes)
-                inv = sk.Placement.inverse()
-                for (cx, cy, r) in f["circles"]:    # global -> sketch-local coords
+                inv = sk.Placement.inverse()        # global -> sketch-local coords
+                for (cx, cy, r) in f["circles"]:
                     lp = inv.multVec(App.Vector(cx, cy, zref))
                     sk.addGeometry(Part.Circle(App.Vector(lp.x, lp.y, 0), App.Vector(0, 0, 1), r), False)
+                for (w, h, cx, cy) in f.get("rects", []):
+                    lp = inv.multVec(App.Vector(cx, cy, zref))       # top/bottom face -> axis-aligned
+                    _add_rect(sk, w, h, lp.x, lp.y)
+                for poly in f.get("polys", []):
+                    _add_poly(sk, _map_poly(poly, inv, zref))
             else:
                 plane = f.get("plane", "XY")
                 if plane == "XZ":                     # revolve profile: local (u,v) -> global (x=u, z=v)
@@ -138,6 +151,34 @@ def build(spec, out_path):
                 ctr = App.Vector(mr * math.cos(math.radians(a)), mr * math.sin(math.radians(a)), zc)
                 cyl.Placement = App.Placement(ctr - axis * (L / 2.0), rot)
                 tip = cyl
+        elif kind == "prism_cut":
+            # A placed profile-along-an-axis cut: a datum plane at {origin, xdir, normal}, a sketch of
+            # the polys on it, and a Pocket of `depth` along +normal (Reversed, since a PartDesign
+            # Pocket cuts opposite the sketch normal by default). Mirrors b3d_emit's prism_cut.
+            ox = App.Vector(*f["origin"])
+            zx = App.Vector(*f["normal"]); zx.normalize()
+            xx = App.Vector(*f["xdir"]); xx.normalize()
+            yx = zx.cross(xx)
+            plc = App.Placement(App.Matrix(xx.x, yx.x, zx.x, ox.x,
+                                           xx.y, yx.y, zx.y, ox.y,
+                                           xx.z, yx.z, zx.z, ox.z,
+                                           0, 0, 0, 1))
+            dp = body.newObject("PartDesign::Plane", f["name"] + "_pl")
+            dp.MapMode = "Deactivated"
+            dp.Placement = plc
+            doc.recompute()
+            sk = body.newObject("Sketcher::SketchObject", f["name"] + "_sk")
+            sk.AttachmentSupport = [(dp, "")]
+            sk.MapMode = "FlatFace"
+            doc.recompute()
+            for poly in f["polys"]:                 # polys are already in the plane's local (u, v) frame
+                _add_poly(sk, poly)
+            p = body.newObject("PartDesign::Pocket", f["name"])
+            p.Label = f["name"]
+            p.Profile = sk
+            p.Length = f["depth"]
+            p.Reversed = True                       # cut along +normal (the datum's Z)
+            tip = p
         else:
             raise ValueError(f"unknown feature kind: {kind}")
         doc.recompute()

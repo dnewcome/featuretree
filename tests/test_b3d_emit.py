@@ -86,6 +86,32 @@ def test_polar_pocket_cuts_a_ring():
     assert v1 < v0 and len(part.solids()) == 1
 
 
+def test_prism_cut_axial_pocket():
+    """prism_cut with a Z normal removes a profile*depth pocket (a placed cut, not face-attached)."""
+    _, v = emit(IR.part("p", IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("b", "o", 10),
+                        IR.prism_cut("pk", origin=(0, 0, 6), normal=(0, 0, 1), xdir=(1, 0, 0),
+                                     depth=4, polys=[[(-5, -5), (5, -5), (5, 5), (-5, 5)]])))
+    assert v == pytest.approx(12000 - 100 * 4)
+
+
+def test_prism_cut_cross_axis_hole():
+    """prism_cut with a Y normal and an arc profile drills a cross-axis hole through the width."""
+    _, v = emit(IR.part("p", IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("b", "o", 10),
+                        IR.prism_cut("xh", origin=(0, -15, 5), normal=(0, 1, 0), xdir=(1, 0, 0),
+                                     depth=30, polys=[[(-3, 0, 1.0), (3, 0, 1.0)]])))
+    assert v == pytest.approx(12000 - math.pi * 9 * 30, rel=1e-3)
+
+
+def test_prism_cut_direction_is_the_normal_not_the_winding():
+    """A prism_cut with a hole-in-region profile (a ring) must extrude along its stated normal, not
+    the region face's winding-dependent normal — else it cuts the wrong way and over-removes."""
+    ring = [[(-8, -8), (8, -8), (8, 8), (-8, 8)], [(-3, -3), (3, -3), (3, 3), (-3, 3)]]  # 16x16 - 6x6
+    _, v = emit(IR.part("p", IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("b", "o", 10),
+                        IR.prism_cut("pk", origin=(0, 0, 6), normal=(0, 0, 1), xdir=(1, 0, 0),
+                                     depth=4, polys=ring)))
+    assert v == pytest.approx(12000 - (16 * 16 - 6 * 6) * 4)   # cut z in [6,10], leaves a solid boss
+
+
 def test_fillet_by_query_reduces_volume():
     sharp = IR.part("s", IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("b", "o", 6))
     round_ = IR.part("r", IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("b", "o", 6),
