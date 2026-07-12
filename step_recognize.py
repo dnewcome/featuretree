@@ -277,22 +277,36 @@ def _recognize_extrude(orig, name):
     feats = [_sketch_from_outline("outline", outline),
              IR.pad("body", "outline", length=round(thick, 4))]
 
-    # 2. HOLES: concave cylindrical faces with a Z axis -> circle pocket (through or blind). Skip any
-    # cylinder whose circle is part of the OUTER wire — that's a rounded corner/side of the outline
-    # (already captured as an arc), not a hole.
-    outline_arcs = {(round(e.arc_center.X, 2), round(e.arc_center.Y, 2), round(e.radius, 2))
-                    for e in outer.edges().filter_by(GeomType.CIRCLE)}
-    through, blind = [], []
-    for f in solid.faces().filter_by(GeomType.CYLINDER):
-        h = _cyl_hole(f, base_z, top_z, warnings, outline_arcs)
-        if h is None:
+    # 2a. THROUGH holes = the base face's INNER wires — ANY shape (circle, slot, obround, polygon,
+    # arcs), not just circular bores. Circles -> one drill sketch; each non-circular wire -> a poly
+    # cut. `captured` collects every wire's circular-edge signature (outer + inner) so their cylinders
+    # aren't re-detected as blind holes below.
+    def _sig(e):
+        return (round(e.arc_center.X, 2), round(e.arc_center.Y, 2), round(e.radius, 2))
+    captured = {_sig(e) for e in outer.edges().filter_by(GeomType.CIRCLE)}
+    thru_circ, thru_poly = [], []
+    for w in base_face.inner_wires():
+        cl = _classify_wire(w, warnings)
+        if cl is None:
             continue
-        (through if h["through"] else blind).append(h)
-
-    if through:
-        circles = [(h["x"], h["y"], h["r"]) for h in through]
-        feats.append(IR.sketch("holes", "XY", circles=circles))
+        captured.update(_sig(e) for e in w.edges().filter_by(GeomType.CIRCLE))
+        (thru_circ if cl[0] == "circle" else thru_poly).append(
+            (cl[1], cl[2], cl[3]) if cl[0] == "circle" else cl[1])
+    if thru_circ:
+        feats.append(IR.sketch("holes", "XY", circles=thru_circ))
         feats.append(IR.pocket("drill", "holes", through=True))
+    for i, poly in enumerate(thru_poly):
+        feats.append(IR.sketch(f"cut_sk{i}", "XY", polys=[poly]))
+        feats.append(IR.pocket(f"cut{i}", f"cut_sk{i}", through=True))
+
+    # 2b. BLIND holes = concave Z-cylinders that DON'T span the thickness (circular only), excluding
+    # any cylinder whose circle belongs to a wire we already captured (outline arcs, through-holes).
+    blind = []
+    for f in solid.faces().filter_by(GeomType.CYLINDER):
+        h = _cyl_hole(f, base_z, top_z, warnings, captured)
+        if h is None or h["through"]:
+            continue
+        blind.append(h)
     for i, h in enumerate(blind):
         sk = IR.sketch(f"blind_sk{i}", circles=[(h["x"], h["y"], h["r"])],
                        on={"face_of": "body", "side": h["side"]})
@@ -301,7 +315,7 @@ def _recognize_extrude(orig, name):
 
     spec = IR.part(name, *feats)
     return spec, {"method": "extrude", "axis": axis, "warnings": warnings,
-                  "through_holes": len(through), "blind_holes": len(blind)}
+                  "through_holes": len(thru_circ) + len(thru_poly), "blind_holes": len(blind)}
 
 
 def _sketch_from_outline(sk_name, outline):
@@ -399,6 +413,16 @@ def _fixtures(tmp):
     p = Path(tmp) / "cone.step"
     export_step(cpart, str(p))
     paths["cone"] = str(p)
+    # SLOT: a plate with a native OBROUND through-hole (non-circular hole — arcs in a hole wire)
+    from build123d import BuildPart, BuildSketch, Box, SlotOverall, extrude, Mode, Plane
+    with BuildPart() as sp:
+        Box(30, 16, 5)
+        with BuildSketch(Plane.XY):
+            SlotOverall(12, 6)
+        extrude(amount=5, both=True, mode=Mode.SUBTRACT)
+    p = Path(tmp) / "slot.step"
+    export_step(sp.part, str(p))
+    paths["slot"] = str(p)
     return paths
 
 
@@ -406,7 +430,7 @@ def selftest():
     import tempfile
     paths = _fixtures(tempfile.mkdtemp())
     problems = []
-    for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape", "cone"):   # in scope -> VERIFY at Δ≈0
+    for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape", "cone", "slot"):  # in scope -> VERIFY
         _, rep = recognize(paths[nm])
         print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "
               f"vol Δ{rep['dvol_pct']}%  (method={rep.get('method')}, thru={rep['through_holes']})")
