@@ -52,20 +52,33 @@ def _poly_face(poly, plane_obj):
     return sk.sketch
 
 
+def _polys_region(polys, plane_obj):
+    """polys[0] is the outer profile, polys[1:] are holes IN it -> one face (outer minus holes),
+    matching the IR spec and the FreeCAD emitter. None if there are no polys."""
+    if not polys:
+        return None
+    region = _poly_face(polys[0], plane_obj)
+    for hole in polys[1:]:
+        region = region - _poly_face(hole, plane_obj)
+    return region
+
+
 def _sketch_faces(f, z0, plane="XY"):
     """The IR sketch's closed regions as build123d faces. On XY: circles/rects each their own
     region, polys[0] an outer profile with polys[1:] as holes, all at z=z0. On XZ (a revolve
     profile): polys placed in the XZ plane (x = radius, z = axial). polys may carry arcs (bulge)."""
     if plane == "XZ":
-        return [_poly_face(poly, Plane.XZ) for poly in f.get("polys", [])]   # (x,y)->(radius, axial)
+        r = _polys_region(f.get("polys", []), Plane.XZ)   # (x,y)->(radius, axial)
+        return [r] if r is not None else []
     pl = Plane.XY.offset(z0)
     faces = []
     for (cx, cy, r) in f.get("circles", []):
         faces.append(Pos(cx, cy, z0) * Circle(r))
     for (w, h, cx, cy) in f.get("rects", []):
         faces.append(Pos(cx, cy, z0) * Rectangle(w, h))
-    for poly in f.get("polys", []):
-        faces.append(_poly_face(poly, pl))
+    region = _polys_region(f.get("polys", []), pl)
+    if region is not None:
+        faces.append(region)
     return faces
 
 

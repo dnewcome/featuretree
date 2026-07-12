@@ -131,13 +131,15 @@ print(report["verified"], report["dvol_pct"])           # True 0.0
 
 ```bash
 python3 step_recognize.py plate.step --emit plate.ir.json   # recover + write the IR
-python3 step_recognize.py --selftest                        # generate fixtures, assert (CI)
+python3 step_recognize.py --selftest                        # generate fixtures, assert (quick CI)
+python3 -m pytest tests/                                     # full test suite (emit + recognize)
 ```
 
-**Out of scope** (surfaced as PARTIAL, never silently wrong): fillets/chamfers, non-Z extrusion,
-additive bosses on the base, and revolves / lofts / sweeps / freeform — there is no faithful feature
-tree to recover there (feature recognition is inference, non-unique in general), so the verifier
-rejects them rather than guess.
+Handled: extrudes and revolves in **any orientation**, profiles with **straight edges + arcs**,
+and through-holes of **any shape** (circle, slot/obround, polygon). **Out of scope** (surfaced as
+PARTIAL, never silently wrong): fillets/chamfers, additive bosses, non-circular *blind* pockets,
+and lofts / sweeps / freeform — there is no faithful feature tree to recover there (recognition is
+inference, non-unique in general), so the verifier rejects them rather than guess.
 
 ### Bridging IN from build123d (the reverse direction)
 
