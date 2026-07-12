@@ -130,7 +130,9 @@ print(report["verified"], report["dvol_pct"])           # True 0.0
 ```
 
 ```bash
-python3 step_recognize.py plate.step --emit plate.ir.json   # recover + write the IR
+python3 step_recognize.py part.step --stl out.stl           # recover + write a viewable solid
+python3 step_recognize.py part.step --fcstd out.FCStd       # recover + write an editable FreeCAD tree
+python3 step_recognize.py part.step --emit out.ir.json      # recover + write the IR
 python3 step_recognize.py --selftest                        # generate fixtures, assert (quick CI)
 python3 -m pytest tests/                                     # full test suite (emit + recognize)
 ```

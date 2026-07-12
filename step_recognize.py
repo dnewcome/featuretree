@@ -20,7 +20,10 @@ scope (surfaced as residual, never silently wrong): fillets/chamfers, revolves /
 freeform, additive bosses, and profiles whose boundary has ARCS (straight-edge polygons + circular
 holes only for now — arc-wire support is the next increment).
 
-    python step_recognize.py part.step [--emit part.ir.json]
+    python step_recognize.py part.step                    # recognize + print the tree/verdict
+    python step_recognize.py part.step --stl out.stl      # + write the recovered solid (mesh viewer)
+    python step_recognize.py part.step --fcstd out.FCStd  # + write an editable FreeCAD tree
+    python step_recognize.py part.step --emit out.ir.json # + write the recovered IR
     from step_recognize import recognize;  spec, report = recognize("part.step")
 """
 
@@ -487,10 +490,21 @@ def main():
     for w in report["warnings"]:
         print(f"  ! {w}")
     print(f"  => {tag}" + ("" if v else " — fall back to importing the STEP as one solid"))
-    if "--emit" in args:
-        out = Path(args[args.index("--emit") + 1])
-        out.write_text(json.dumps(spec, indent=2))
-        print(f"  wrote {out}")
+
+    def _arg(flag):
+        return Path(args[args.index(flag) + 1]) if flag in args else None
+    if _arg("--emit"):
+        _arg("--emit").write_text(json.dumps(spec, indent=2))
+        print(f"  wrote {_arg('--emit')}  (recovered IR)")
+    if _arg("--stl"):
+        from build123d import export_stl
+        part, _ = b3d_emit.emit(spec)
+        export_stl(part, str(_arg("--stl")))
+        print(f"  wrote {_arg('--stl')}  (build123d solid — view in any mesh viewer)")
+    if _arg("--fcstd"):
+        import gen                                   # emits via FreeCAD (needs the AppImage)
+        gen.emit(spec, str(_arg("--fcstd")))
+        print(f"  wrote {_arg('--fcstd')}  (editable FreeCAD tree)")
     return 0 if v else 1
 
 

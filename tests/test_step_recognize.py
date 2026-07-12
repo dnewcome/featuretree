@@ -165,6 +165,21 @@ def test_nist_ctc01_best_effort_partial():
     assert any("not captured" in w for w in rep["warnings"])   # flags the chamfers / cross-holes
 
 
+def test_cli_stl_output(tmp_path):
+    """`step_recognize.py part.step --stl out.stl` recovers AND writes a viewable solid in one shot."""
+    import subprocess
+    import sys as _sys
+    import trimesh
+    step = emit_step(IR.SAMPLES["plate"](), tmp_path)
+    out = tmp_path / "recovered.stl"
+    repo = Path(__file__).resolve().parent.parent
+    r = subprocess.run([_sys.executable, str(repo / "step_recognize.py"), step, "--stl", str(out)],
+                       capture_output=True, text=True, cwd=str(repo))
+    assert out.exists(), r.stdout + r.stderr
+    m = trimesh.load(str(out))
+    assert m.is_watertight and m.volume == pytest.approx(11497.3, rel=1e-3)
+
+
 def test_emit_roundtrip_reproduces_volume(tmp_path):
     """recognize -> the recovered IR re-emits to the same volume as the STEP (that IS 'verified')."""
     import b3d_emit
