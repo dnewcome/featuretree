@@ -110,37 +110,49 @@ def _normal(f):
 
 
 def _classify_wire(wire, warnings):
-    """A closed outer wire -> ('circle', cx, cy, r) | ('poly', [(x,y),...]) | None (unsupported)."""
+    """A closed outer wire -> ('circle', cx, cy, r) | ('poly', [(x,y[,bulge]),...]) | None.
+    Handles lines AND circular arcs (as DXF bulges); rejects splines / ellipses."""
     edges = wire.edges()
     circ = edges.filter_by(GeomType.CIRCLE)
     if len(edges) == 1 and len(circ) == 1:
         c = circ[0]
         return ("circle", round(c.arc_center.X, 4), round(c.arc_center.Y, 4), round(c.radius, 4))
-    if len(circ) == 0 and all(e.geom_type == GeomType.LINE for e in edges):
+    if all(e.geom_type in (GeomType.LINE, GeomType.CIRCLE) for e in edges):
         return ("poly", _ordered_poly(edges))
-    warnings.append("outline has arcs/splines (not a circle or straight polygon) — unsupported")
+    warnings.append("outline has splines/ellipses — unsupported (lines + circular arcs only)")
     return None
 
 
+def _edge_bulge(e):
+    """DXF bulge tan(theta/4) of a circular-arc edge = 2*(signed sagitta)/chord; 0 for a line."""
+    if e.geom_type != GeomType.CIRCLE:
+        return 0.0
+    a, b, m = e @ 0.0, e @ 1.0, e @ 0.5
+    chord = math.hypot(b.X - a.X, b.Y - a.Y)
+    if chord < EPS:
+        return 0.0
+    ux, uy = (b.X - a.X) / chord, (b.Y - a.Y) / chord      # chord dir; left normal = (-uy, ux)
+    sag = -uy * (m.X - a.X) + ux * (m.Y - a.Y)             # signed dist chord->arc-mid
+    return round(2.0 * sag / chord, 6)
+
+
 def _ordered_poly(edges):
-    """Chain straight edges by shared endpoints into an ordered vertex loop."""
-    segs = [(_r2(e @ 0.0), _r2(e @ 1.0)) for e in edges]
-    pts = [segs[0][0], segs[0][1]]
-    used = {0}
+    """Chain line/arc edges by shared endpoints into an ordered loop of (x, y, bulge), where the
+    bulge on each vertex describes the segment LEAVING it (0 = straight)."""
+    segs = [(_r2(e @ 0.0), _r2(e @ 1.0), _edge_bulge(e)) for e in edges]
+    order = [(segs[0][0], segs[0][2])]            # (vertex, outgoing bulge)
+    used, tail = {0}, segs[0][1]
     while len(used) < len(segs):
-        tail = pts[-1]
-        for i, (a, b) in enumerate(segs):
+        for i, (s, e, bl) in enumerate(segs):
             if i in used:
                 continue
-            if _close(a, tail):
-                pts.append(b); used.add(i); break
-            if _close(b, tail):
-                pts.append(a); used.add(i); break
+            if _close(s, tail):
+                order.append((s, bl)); used.add(i); tail = e; break
+            if _close(e, tail):
+                order.append((e, -bl)); used.add(i); tail = s; break   # reversed arc -> flip bulge
         else:
             break
-    if len(pts) > 1 and _close(pts[0], pts[-1]):
-        pts.pop()
-    return pts
+    return [[p[0], p[1], b] for (p, b) in order]
 
 
 def _close(a, b):
@@ -170,17 +182,22 @@ def recognize(step_path, name=None, verify=True):
     if not bottoms:
         raise ValueError("no Z-normal planar face at the base — not a Z-prismatic part")
     base_face = max(bottoms, key=lambda f: f.area)
-    outline = _classify_wire(base_face.outer_wire(), warnings)
+    outer = base_face.outer_wire()
+    outline = _classify_wire(outer, warnings)
     if outline is None:
-        raise ValueError("base outline not recognizable as a circle or straight polygon")
+        raise ValueError("base outline not recognizable (lines + circular arcs only; has splines/ellipses)")
 
     feats = [_sketch_from_outline("outline", outline),
              IR.pad("body", "outline", length=round(thick, 4))]
 
-    # 2. HOLES: concave cylindrical faces with a Z axis -> circle pocket (through or blind).
+    # 2. HOLES: concave cylindrical faces with a Z axis -> circle pocket (through or blind). Skip any
+    # cylinder whose circle is part of the OUTER wire — that's a rounded corner/side of the outline
+    # (already captured as an arc), not a hole.
+    outline_arcs = {(round(e.arc_center.X, 2), round(e.arc_center.Y, 2), round(e.radius, 2))
+                    for e in outer.edges().filter_by(GeomType.CIRCLE)}
     through, blind = [], []
     for f in solid.faces().filter_by(GeomType.CYLINDER):
-        h = _cyl_hole(f, base_z, top_z, warnings)
+        h = _cyl_hole(f, base_z, top_z, warnings, outline_arcs)
         if h is None:
             continue
         (through if h["through"] else blind).append(h)
@@ -212,13 +229,16 @@ def _sketch_from_outline(sk_name, outline):
     return IR.sketch(sk_name, "XY", polys=[outline[1]])
 
 
-def _cyl_hole(face, base_z, top_z, warnings):
-    """A cylindrical face -> a hole dict if it is concave (material outside) with a ~Z axis."""
+def _cyl_hole(face, base_z, top_z, warnings, outline_arcs=frozenset()):
+    """A cylindrical face -> a hole dict if it is concave (material outside) with a ~Z axis and is
+    NOT part of the outer wire (a rounded outline corner)."""
     ces = face.edges().filter_by(GeomType.CIRCLE)
     if not ces:
         return None
     ctr = ces[0].arc_center
     r = ces[0].radius
+    if (round(ctr.X, 2), round(ctr.Y, 2), round(r, 2)) in outline_arcs:
+        return None                       # this cylinder is an outline arc, already in the profile
     if any(abs(e.radius - r) > EPS for e in ces):
         return None                       # tapered/variable — not a straight bore
     zs = [e.arc_center.Z for e in ces]
@@ -279,6 +299,15 @@ def _fixtures(tmp):
     p = Path(tmp) / "off_axis.step"
     export_step(lbr.rotate(Axis((0, 0, 0), (1, 0, 0)), 90), str(p))
     paths["off_axis"] = str(p)
+    # ARC boundary: a D-shape (one rounded side, bulge) — profile has a circular arc, not just lines
+    dshape = IR.part("dshape",
+                     IR.sketch("o", "XY", polys=[[(-10, -10, 0.0), (10, -10, 0.0),
+                                                  (10, 10, 0.0), (-10, 10, 0.6)]]),
+                     IR.pad("body", "o", length=5))
+    dpart, _ = b3d_emit.emit(dshape)
+    p = Path(tmp) / "dshape.step"
+    export_step(dpart, str(p))
+    paths["dshape"] = str(p)
     return paths
 
 
@@ -286,7 +315,7 @@ def selftest():
     import tempfile
     paths = _fixtures(tempfile.mkdtemp())
     problems = []
-    for nm in ("plate", "poly", "disc_hole", "off_axis"):   # in scope -> must VERIFY at Δ≈0
+    for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape"):   # in scope -> must VERIFY at Δ≈0
         _, rep = recognize(paths[nm])
         ax = rep.get("extrude_axis")
         print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "

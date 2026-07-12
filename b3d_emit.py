@@ -22,35 +22,50 @@ import math
 import sys
 from pathlib import Path
 
-from build123d import (Align, Axis, Circle, Cylinder, GeomType, Plane, Polygon, Pos, Rectangle,
-                       Rot, export_stl, extrude, fillet, revolve)
+from build123d import (Align, Axis, BuildLine, BuildSketch, Circle, Cylinder, GeomType, Line,
+                       Plane, Polygon, Pos, Rectangle, Rot, SagittaArc, export_stl, extrude,
+                       fillet, make_face, revolve)
 
 _BIG = 1.0e4  # a through-cut overshoot (mm), clipped by the actual solid
+
+
+def _poly_face(poly, plane_obj):
+    """A wire of (x, y[, bulge]) vertices -> a build123d face on plane_obj. bulge is the DXF arc
+    factor tan(theta/4) for the segment to the NEXT vertex (0 / absent = straight); sign = CCW(+)."""
+    pts = [(float(p[0]), float(p[1])) for p in poly]
+    bul = [float(p[2]) if len(p) > 2 else 0.0 for p in poly]
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts, bul = pts[:-1], bul[:-1]
+    if all(abs(b) < 1e-9 for b in bul):
+        return plane_obj * Polygon(*pts, align=None)     # straight polygon (fast path)
+    n = len(pts)
+    with BuildSketch(plane_obj) as sk:
+        with BuildLine(plane_obj):
+            for i in range(n):
+                p1, p2, b = pts[i], pts[(i + 1) % n], bul[i]
+                if abs(b) < 1e-9:
+                    Line(p1, p2)
+                else:
+                    chord = math.dist(p1, p2)
+                    SagittaArc(p1, p2, b * chord / 2.0)
+        make_face()
+    return sk.sketch
 
 
 def _sketch_faces(f, z0, plane="XY"):
     """The IR sketch's closed regions as build123d faces. On XY: circles/rects each their own
     region, polys[0] an outer profile with polys[1:] as holes, all at z=z0. On XZ (a revolve
-    profile): polys placed in the XZ plane (x = radius, z = axial)."""
+    profile): polys placed in the XZ plane (x = radius, z = axial). polys may carry arcs (bulge)."""
     if plane == "XZ":
-        faces = []
-        for poly in f.get("polys", []):
-            pts = [tuple(p) for p in poly]
-            if len(pts) > 1 and pts[0] == pts[-1]:
-                pts = pts[:-1]
-            faces.append(Plane.XZ * Polygon(*pts, align=None))   # (x,y)->(radius, axial)
-        return faces
+        return [_poly_face(poly, Plane.XZ) for poly in f.get("polys", [])]   # (x,y)->(radius, axial)
+    pl = Plane.XY.offset(z0)
     faces = []
     for (cx, cy, r) in f.get("circles", []):
         faces.append(Pos(cx, cy, z0) * Circle(r))
     for (w, h, cx, cy) in f.get("rects", []):
         faces.append(Pos(cx, cy, z0) * Rectangle(w, h))
     for poly in f.get("polys", []):
-        pts = [tuple(p) for p in poly]
-        if len(pts) > 1 and pts[0] == pts[-1]:
-            pts = pts[:-1]
-        region = Polygon(*pts, align=None)            # absolute coords, not re-centered
-        faces.append(Pos(0, 0, z0) * region)
+        faces.append(_poly_face(poly, pl))
     return faces
 
 

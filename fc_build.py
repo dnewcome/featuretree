@@ -30,13 +30,24 @@ def _add_rect(sk, w, h, cx, cy):
 
 
 def _add_poly(sk, pts):
-    """Closed polyline from [(x, y), ...] — drops a duplicate closing vertex if present."""
-    vs = [App.Vector(x, y, 0) for (x, y) in pts]
-    if len(vs) > 1 and (vs[0] - vs[-1]).Length < 1e-7:
-        vs = vs[:-1]
-    n = len(vs)
+    """Closed wire from [(x, y[, bulge]), ...]. bulge = DXF arc factor tan(theta/4) for the segment
+    to the NEXT vertex (0/absent = a line, sign = CCW+). Drops a duplicate closing vertex."""
+    v = [(float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0) for p in pts]
+    if len(v) > 1 and abs(v[0][0] - v[-1][0]) < 1e-7 and abs(v[0][1] - v[-1][1]) < 1e-7:
+        v = v[:-1]
+    n = len(v)
     for i in range(n):
-        sk.addGeometry(Part.LineSegment(vs[i], vs[(i + 1) % n]), False)
+        x1, y1, b = v[i]
+        x2, y2, _ = v[(i + 1) % n]
+        p1, p2 = App.Vector(x1, y1, 0), App.Vector(x2, y2, 0)
+        if abs(b) < 1e-9:
+            sk.addGeometry(Part.LineSegment(p1, p2), False)
+        else:                                     # 3-point arc: chord midpoint + perpendicular*sagitta
+            chord = math.hypot(x2 - x1, y2 - y1)
+            sag = b * chord / 2.0
+            ux, uy = (x2 - x1) / chord, (y2 - y1) / chord   # left normal = (-uy, ux)
+            mid = App.Vector((x1 + x2) / 2 - uy * sag, (y1 + y2) / 2 + ux * sag, 0)
+            sk.addGeometry(Part.Arc(p1, mid, p2), False)
 
 
 def build(spec, out_path):
