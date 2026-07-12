@@ -2,10 +2,15 @@
 
 A STEP file is a dumb B-rep: geometry, no feature tree. You cannot *convert* it to an IR;
 you can only *infer* one. The insight this leans on: **most machined/printed parts are a 2D
-profile extruded along some axis** (plus holes). So the core intelligence is CROSS-SECTIONAL —
-find the axis the solid is a prismatic extrusion along (every face is planar-perpendicular,
-planar-parallel, or a cylinder parallel to it), rotate that axis onto Z, and recover the profile
-+ through/blind holes. Orientation-agnostic: a part extruded along X or Y is found the same way.
+profile EXTRUDED along some axis, or REVOLVED about one** (plus holes). So the core intelligence
+is CROSS-SECTIONAL. recognize() tries both:
+  * EXTRUDE — find the axis the solid is a prismatic extrusion along (every face is
+    planar-perpendicular, planar-parallel, or a cylinder parallel to it), rotate it onto Z, and
+    recover the profile + through/blind holes. Orientation-agnostic (X/Y/Z or any face normal).
+  * REVOLVE — find the axis the solid is unchanged under rotation about (a body of revolution),
+    take the MERIDIAN (a half-plane section through the axis) as the profile, emit revolve(360).
+Profiles may have straight edges AND circular arcs (DXF bulge). It returns whichever the re-emit
+verifies.
 
 The honesty comes from SELF-VERIFICATION: the recognized IR is re-emitted through b3d_emit and
 its volume + (rotation-tolerant) bounding box are compared to the original STEP. So every result
@@ -24,7 +29,7 @@ import math
 import sys
 from pathlib import Path
 
-from build123d import Axis, GeomType, Vector, import_step
+from build123d import Axis, GeomType, Plane, Pos, Rectangle, Vector, import_step
 
 import ir as IR
 import b3d_emit
@@ -88,7 +93,7 @@ def _find_extrude_axis(solid):
 
 
 def _align_to_z(solid, a):
-    """Rotate the solid so extrude axis `a` lands on +Z (the IR's extrude direction)."""
+    """Rotate the solid so axis `a` lands on +Z (the IR's extrude/revolve axis)."""
     a = a.normalized()
     z = Vector(0, 0, 1)
     if abs(a.dot(z)) > 1 - ANG:
@@ -96,6 +101,64 @@ def _align_to_z(solid, a):
     axis_dir = a.cross(z)
     angle = math.degrees(math.acos(max(-1.0, min(1.0, a.dot(z)))))
     return solid.rotate(Axis((0, 0, 0), axis_dir.to_tuple()), angle)
+
+
+# --- revolve intelligence: is this solid a body of revolution about SOME axis? -----------------
+# Robust test: rotating a body of revolution by any angle about its axis leaves it unchanged. So
+# rotate by a non-special angle and check the symmetric-difference volume is ~0 — works for any
+# surface types (cone/sphere/torus/bspline), unlike a per-face axis check. Then the MERIDIAN (the
+# 2D section in a half-plane through the axis) is the profile the IR revolves.
+
+def _is_revolve_about(solid, a, delta=17.0):
+    try:
+        rot = solid.rotate(Axis((0, 0, 0), a.normalized().to_tuple()), delta)
+        slack = (solid - rot).volume + (rot - solid).volume
+    except Exception:
+        return False
+    return slack < 1e-3 * solid.volume
+
+
+def _find_revolve_axis(solid):
+    cands = [Vector(0, 0, 1), Vector(0, 1, 0), Vector(1, 0, 0)]
+    for gt in (GeomType.CYLINDER, GeomType.CONE):
+        for f in solid.faces().filter_by(gt):
+            ax = _cyl_axis(f)                     # axis via the circular edges' centers
+            if ax:
+                cands.append(ax)
+    seen = []
+    for a in cands:
+        if a.length < EPS or any(abs(a.dot(u)) > 1 - ANG for u in seen):
+            continue
+        seen.append(a.normalized())
+        if _is_revolve_about(solid, a):
+            return a.normalized()
+    return None
+
+
+def _recognize_revolve(orig, name):
+    """Recognize a body of revolution: find the axis, take the meridian (half-plane section), and
+    emit an XZ profile + revolve(360). Returns (spec, extras) or raises."""
+    axis = _find_revolve_axis(orig)
+    if axis is None:
+        raise ValueError("not a body of revolution")
+    solid = _align_to_z(orig, axis)
+    bb = solid.bounding_box()
+    R, H = bb.max.X + max(1.0, 0.1 * bb.size.X), bb.size.Z + 2
+    zc = (bb.min.Z + bb.max.Z) / 2                          # center the section on the solid's z-range
+    half = Plane.XZ * Pos(R / 2, zc, 0) * Rectangle(R, H)   # a face on XZ spanning x in [0, R]
+    faces = solid.intersect(half).faces()
+    if len(faces) != 1:
+        raise ValueError(f"revolve meridian has {len(faces)} regions (axial hole etc. — unsupported)")
+    merid = faces[0].rotate(Axis((0, 0, 0), (1, 0, 0)), -90)   # XZ (r,axial) -> XY (x=r, y=axial)
+    warnings = []
+    prof = _classify_wire(merid.outer_wire(), warnings)
+    if prof is None or prof[0] != "poly":
+        raise ValueError("revolve meridian is not a line/arc profile")
+    spec = IR.part(name,
+                   IR.sketch("section", "XZ", polys=[prof[1]]),
+                   IR.revolve("body", "section", angle=360.0))
+    return spec, {"warnings": warnings, "method": "revolve", "axis": axis,
+                  "through_holes": 0, "blind_holes": 0}
 
 
 def _r2(v):
@@ -160,13 +223,37 @@ def _close(a, b):
 
 
 def recognize(step_path, name=None, verify=True):
-    """STEP file -> (IR spec, report). report.verified is True iff the re-emitted IR
-    reproduces the STEP's volume + bbox within tolerance."""
+    """STEP file -> (IR spec, report). Tries EXTRUDE then REVOLVE, returning whichever the re-emit
+    VERIFIES (Δvol≈0); if neither verifies, the closer residual. report.verified says which."""
     orig = import_step(str(step_path))
     orig = orig.solid() if hasattr(orig, "solid") else orig
     name = name or Path(step_path).stem
-    warnings = []
+    candidates = []
+    for fn in (_recognize_extrude, _recognize_revolve):
+        try:
+            spec, extras = fn(orig, name)
+        except Exception:
+            continue
+        ax = extras.get("axis")
+        report = {"name": name, "features": len(spec["features"]), "method": extras.get("method"),
+                  "through_holes": extras.get("through_holes", 0),
+                  "blind_holes": extras.get("blind_holes", 0), "warnings": extras.get("warnings", []),
+                  "extrude_axis": tuple(round(c, 3) for c in ax.to_tuple()) if ax is not None else None,
+                  "verified": None}
+        if verify:
+            report.update(_verify(spec, orig))
+        if not verify or report.get("verified"):
+            return spec, report
+        candidates.append((spec, report))
+    if candidates:
+        return min(candidates, key=lambda c: c[1].get("dvol_pct", 1e9))
+    raise ValueError("neither a recognizable extrude nor a body of revolution")
 
+
+def _recognize_extrude(orig, name):
+    """Recognize a 2D profile extruded along some axis (+ through/blind holes). Returns
+    (spec, extras) or raises if it isn't a prismatic extrusion."""
+    warnings = []
     # cross-section intelligence: find the axis this solid is a prismatic extrusion along (any
     # orientation) and rotate it onto Z, so the Z-profile+holes logic below is axis-agnostic.
     axis = _find_extrude_axis(orig)
@@ -213,13 +300,8 @@ def recognize(step_path, name=None, verify=True):
         feats.append(IR.pocket(f"blind{i}", f"blind_sk{i}", through=False, length=round(h["depth"], 4)))
 
     spec = IR.part(name, *feats)
-
-    report = {"name": name, "features": len(feats), "through_holes": len(through),
-              "blind_holes": len(blind), "warnings": warnings, "verified": None,
-              "extrude_axis": tuple(round(c, 3) for c in axis.to_tuple()) if axis is not None else None}
-    if verify:
-        report.update(_verify(spec, orig))
-    return spec, report
+    return spec, {"method": "extrude", "axis": axis, "warnings": warnings,
+                  "through_holes": len(through), "blind_holes": len(blind)}
 
 
 def _sketch_from_outline(sk_name, outline):
@@ -281,12 +363,12 @@ def _fixtures(tmp):
     disc = IR.part("disc_hole",
                    IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("body", "o", length=8),
                    IR.sketch("h", "XY", circles=[(0, 0, 5)]), IR.pocket("drill", "h", through=True))
-    boss = IR.part("boss",                       # base disc + a raised central post (additive)
-                   IR.sketch("o", "XY", circles=[(0, 0, 20)]), IR.pad("body", "o", length=6),
-                   IR.sketch("b", circles=[(0, 0, 6)], on={"face_of": "body", "side": "top"}),
-                   IR.pad("post", "b", length=10))
+    boxpost = IR.part("boxpost",                 # RECTANGULAR base + a raised central post: not a
+                      IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("body", "o", length=6),
+                      IR.sketch("b", circles=[(0, 0, 6)], on={"face_of": "body", "side": "top"}),
+                      IR.pad("post", "b", length=10))   # revolve (rect base) NOR a clean extrude (post)
     specs = {"plate": IR.SAMPLES["plate"](), "poly": IR.SAMPLES["poly"](),
-             "disc_hole": disc, "boss": boss}
+             "disc_hole": disc, "boxpost": boxpost}
     paths = {}
     for nm, spec in specs.items():
         part, _ = b3d_emit.emit(spec)
@@ -308,6 +390,15 @@ def _fixtures(tmp):
     p = Path(tmp) / "dshape.step"
     export_step(dpart, str(p))
     paths["dshape"] = str(p)
+    # REVOLVE: a cone frustum with a bore (a conical face -> the extrude path can't do it, so the
+    # dispatcher must route to revolve). Meridian (r, axial): r2..r10 slanted side + r2 bore.
+    cone = IR.part("cone",
+                   IR.sketch("m", "XZ", polys=[[(2, -8), (10, -8), (2, 8)]]),
+                   IR.revolve("body", "m", angle=360.0))
+    cpart, _ = b3d_emit.emit(cone)
+    p = Path(tmp) / "cone.step"
+    export_step(cpart, str(p))
+    paths["cone"] = str(p)
     return paths
 
 
@@ -315,18 +406,17 @@ def selftest():
     import tempfile
     paths = _fixtures(tempfile.mkdtemp())
     problems = []
-    for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape"):   # in scope -> must VERIFY at Δ≈0
+    for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape", "cone"):   # in scope -> VERIFY at Δ≈0
         _, rep = recognize(paths[nm])
-        ax = rep.get("extrude_axis")
         print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "
-              f"vol Δ{rep['dvol_pct']}%  (thru={rep['through_holes']}, axis={ax})")
+              f"vol Δ{rep['dvol_pct']}%  (method={rep.get('method')}, thru={rep['through_holes']})")
         if not rep["verified"]:
             problems.append(f"{nm}: expected VERIFIED, got Δ{rep['dvol_pct']}%")
-    _, rep = recognize(paths["boss"])                # out of scope -> must be flagged PARTIAL
-    print(f"  {'boss':10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  vol Δ{rep['dvol_pct']}%  "
-          "(additive post — base-extrusion model can't capture it)")
+    _, rep = recognize(paths["boxpost"])             # out of scope -> must be flagged PARTIAL
+    print(f"  {'boxpost':10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  vol Δ{rep['dvol_pct']}%  "
+          "(rect base + additive post — neither a clean extrude nor a revolve)")
     if rep["verified"]:
-        problems.append("boss: an additive-boss part must NOT verify (should fall back to a solid)")
+        problems.append("boxpost: must NOT verify (neither extrude nor revolve should fake it)")
     if problems:
         for p in problems:
             print("FAIL:", p)
